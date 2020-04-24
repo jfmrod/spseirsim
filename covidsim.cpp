@@ -100,8 +100,8 @@ struct ssimstate {
   edoublearray dIs; // 3.5 days as symptomatic
   edoublearray dIa; // 5 days infectious as asymptomatic
 
-  edoublearray dHtoicu; // 7 days to go to ICU
-  edoublearray dHtononicu; // 7 days to go to nonICU
+  edoublearray dHtoicu; // 7 days to go toicu state
+  edoublearray dHtononicu; // 7 days to go tononicu state
 
   edoublearray dHicu; // 10 days in ICU
   edoublearray dHnonicu; // 8 days in nonICU
@@ -112,6 +112,17 @@ struct ssimstate {
   rgamma rIs;
   rgamma rIa;
 
+  rgamma rToicu;
+  rgamma rTononicu;
+  rgamma rInicu;
+  rgamma rInnonicu;
+  rgamma rIpDeath;
+
+  edoublearray icu_symp;
+  edoublearray nonicu_symp;
+  edoublearray death_icu;
+  edoublearray death_nonicu;
+
   ebasicarray<uint8_t> pop_ages;
   ebasicarray<shousehold> households;
 
@@ -120,7 +131,7 @@ struct ssimstate {
 
   int allE=0,allIp=0,allIs=0,allIa=0;
 
-  double all_icu,all_nonicu;
+  double allICU,allNonICU,allD;
 
   evqueuelist evqueue;
 };
@@ -137,12 +148,14 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
           // E -> Ip
           ++st.allIp;
           ++st.hhIp[hhl];
+          ++hs.Ip;
           e.transition=2;
           st.evqueue.add(st,e,st.rIp(r));
         }else{
           // E -> Ia
           ++st.allIa;
           ++st.hhIa[hhl];
+          ++hs.Ia;
           e.transition=1;
           st.evqueue.add(st,e,st.rIa(r));
         }
@@ -154,26 +167,84 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
         --st.allIa;
         --st.hhIa[hhl];
+        --hs.Ia;
        break;
       }
       case 2:{
-        // Ip -> Is
+        // Ip -> Is , Ip -> toicu , Ip -> tononicu , Ip -> death
         shousehold &hs(st.households[e.hhid]);
         uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
         --st.allIp;
         --st.hhIp[hhl];
+        --hs.Ip;
         ++st.allIs;
         ++st.hhIs[hhl];
+        ++hs.Is;
         e.transition=3;
         st.evqueue.add(st,e,st.rIs(r));
+        double rf=rnd.uniform();
+        rf-=st.icu_symp[e.age];
+        if (rf<0.0){
+          e.transition=4;
+          st.evqueue.add(st,e,st.rToicu(r));
+        }else{
+          rf-=st.nonicu_symp[e.age];
+          if (rf<0.0){
+            e.transition=5;
+            st.evqueue.add(st,e,st.rTononicu(r));
+          }
+        }
+        if (rnd.uniform()<st.death_nonicu[e.age]){
+          e.transition=6;
+          st.evqueue.add(st,e,st.rIpDeath(r));
+        }
        break;
       }
       case 3:{
-        // Is ->
+        // Ip -> 
         shousehold &hs(st.households[e.hhid]);
         uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
         --st.allIs;
         --st.hhIs[hhl];
+        --hs.Is;
+       break;
+      }
+      case 4:{
+        // toicu -> icu
+        shousehold &hs(st.households[e.hhid]);
+        uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
+        ++st.allICU;
+        e.transition=7;
+        st.evqueue.add(st,e,st.rInicu(r));
+       break;
+      }
+
+      case 5:{
+        // tononicu -> nonicu
+        shousehold &hs(st.households[e.hhid]);
+        uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
+        ++st.allNonICU;
+        e.transition=8;
+        st.evqueue.add(st,e,st.rInnonicu(r));
+       break;
+      }
+      case 6:{
+        // death
+        ++st.allD;
+       break;
+      }
+      case 7:{
+        // icu -> 
+        shousehold &hs(st.households[e.hhid]);
+        uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
+        --st.allICU;
+       break;
+      }
+      case 8:{
+        // nonicu -> 
+        shousehold &hs(st.households[e.hhid]);
+        uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
+        --st.allNonICU;
        break;
       }
     }
@@ -225,6 +296,12 @@ void evqueuelist::add(ssimstate &st,uint8_t hhsize,uint8_t hhexp,euintarray& cou
         st.hhLevels[hl].erase(st.hhLevels[hl].size()-1);
        
         shousehold &hst(st.households[ev.hhid]);
+
+        // remove Ia, Ip, and Is counts from previous level
+        st.hhIa[hl]-=hst.Ia;
+        st.hhIp[hl]-=hst.Ip;
+        st.hhIs[hl]-=hst.Is;
+
         if (hst.size != hhsize || hst.E != hhexp){
           printf("wrong transition: hst.size: %hhi hhsize: %hhi hst.E: %hhi hhexp: %hhi hhstlevel: %hhi\n",hst.size,hhsize,hst.E,hhexp,hl);
           exit(0);
@@ -236,6 +313,12 @@ void evqueuelist::add(ssimstate &st,uint8_t hhsize,uint8_t hhexp,euintarray& cou
         }
         hst.hstind=st.hhLevels[hlnew].size();
         st.hhLevels[hlnew].add(ev.hhid);
+
+        // add Ia, Ip, and Is counts to new level
+        st.hhIa[hlnew]+=hst.Ia;
+        st.hhIp[hlnew]+=hst.Ip;
+        st.hhIs[hlnew]+=hst.Is;
+
         for (int l=0; l<ic; ++l){ // queue one event per person to track age of exposed individual
           ev.age=st.pop_ages[hst.ageind+hst.E+l];
           eventarr[(ip+i)%eventarr.size()].push_back(ev);
@@ -329,12 +412,12 @@ int emain()
 
   etable agegroup_infparams(etableLoad("data/agegroup.infparams",options));
 
-  cout <<  mularr(agegroup_infparams["Prop_symp_hospitalised"],agegroup_infparams["Prop_hospitalised_critical"]) << endl;
-  cout <<  mularr(agegroup_infparams["Prop_symp_hospitalised"]),addarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0)) << endl;
-  cout <<  edoublearray(agegroup_infparams["Prop_critical_fatal"]) << endl;
-  cout <<  edoublearray(agegroup_infparams["Prop_noncritical_fatal"]) << endl;
+  st.icu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],agegroup_infparams["Prop_hospitalised_critical"]);
+  st.nonicu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],sumarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0));
+  st.death_icu=edoublearray(agegroup_infparams["Prop_critical_fatal"]);
+  st.death_nonicu=edoublearray(agegroup_infparams["Prop_noncritical_fatal"]);
 //  cout << agegroup_infparams << endl;
-  exit(0);
+//  exit(0);
 
 
   // from Davies et al. 2020 covidm_params.R 
@@ -352,15 +435,21 @@ int emain()
   st.rIp=rgamma(1.5,4.0,60.0,0.25); // 1.5 days non-symptomatic
   st.rIs=rgamma(3.5,4.0,60.0,0.25); // 3.5 days as symptomatic
   st.rIa=rgamma(5.0,4.0,60.0,0.25); // 5 days infectious as asymptomatic
+  st.rToicu=rgamma(7.0,7.0,60.0,0.25); // 7 days to go to ICU
+  st.rTononicu=rgamma(7.0,7.0,60.0,0.25); // 7 days to go to ICU
+  st.rInicu=rgamma(10.0,10.0,60.0,0.25); // 10 days in ICU
+  st.rInnonicu=rgamma(8.0,8.0,60.0,0.25); // 8 days in nonICU
+  st.rIpDeath=rgamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
 
 
+/*
   st.dHtoicu=delay_gamma(7.0,7.0,60.0,0.25); // 7 days to go to ICU
   st.dHtononicu=delay_gamma(7.0,7.0,60.0,0.25); // 7 days to go to nonICU
-
   st.dHicu=delay_gamma(10.0,10.0,60.0,0.25); // 10 days in ICU
   st.dHnonicu=delay_gamma(8.0,8.0,60.0,0.25); // 8 days in nonICU
-
   st.dIpD=delay_gamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
+*/
+
 
   int nlevels=householdSizeDist.size()*(householdSizeDist.size()+1)/2;
   st.hhLevels.init(nlevels);
@@ -450,11 +539,13 @@ int emain()
   counts[1]=3;
   st.evqueue.add(st,2,0,counts,st.dE,rnd);
 
-  cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << endl;
-  for (int it=0; it<1000; ++it){
+  st.allICU=0.0;
+  st.allNonICU=0.0;
+  st.allD=0.0;
 
-    st.all_icu=0.0;
-    st.all_nonicu=0.0;
+
+  cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
+  for (int it=0; it<1000; ++it){
 
     fE=double(st.allE)/popsize;
 
@@ -491,7 +582,7 @@ int emain()
       processEvents(st,nextEvents,rnd);
 //      st.allE+=nextEvents.size();
     }
-    cout << it*st.tstep << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allIa << "\t" << st.allIp << "\t" << st.allIs << "\t" << st.all_icu << "\t" << st.all_nonicu << endl;
+    cout << it*st.tstep << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allIa << "\t" << st.allIp << "\t" << st.allIs << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 //   sleep(2);
   }
 
