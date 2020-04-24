@@ -3,7 +3,9 @@
 
 #include <gsl/gsl_cdf.h>
 
+#include <eutils/eparser.h>
 #include <eutils/eparserinterpreter.h>
+#include <eutils/etable.h>
 
 #include <deque>
 
@@ -57,11 +59,13 @@ struct shousehold {
   uint8_t Ia;
   uint8_t Ip;
   uint8_t Is;
+  int ageind;
 };
 
 struct sevent {
   int hhid;
   uint8_t transition;
+  uint8_t age;
 };
 
 class evqueuelist;
@@ -108,6 +112,7 @@ struct ssimstate {
   rgamma rIs;
   rgamma rIa;
 
+  ebasicarray<uint8_t> pop_ages;
   ebasicarray<shousehold> households;
 
   earray<eintarray> hhLevels;
@@ -225,14 +230,17 @@ void evqueuelist::add(ssimstate &st,uint8_t hhsize,uint8_t hhexp,euintarray& cou
           exit(0);
         }
 
-        hst.E+=ic;
         if (hst.E>hst.size){ 
           printf("household exposed larger than household size: hst.E: %hhi hst.size: %hhi hhsize: %hhi hhexp: %hhi ic: %i count.size(): %i\n",hst.E,hst.size,hhsize,hhexp,ic,count.size());
           exit(0);
         }
         hst.hstind=st.hhLevels[hlnew].size();
         st.hhLevels[hlnew].add(ev.hhid);
-        eventarr[(ip+i)%eventarr.size()].push_back(ev);
+        for (int l=0; l<ic; ++l){ // queue one event per person to track age of exposed individual
+          ev.age=st.pop_ages[hst.ageind+hst.E+l];
+          eventarr[(ip+i)%eventarr.size()].push_back(ev);
+        }
+        hst.E+=ic;
       }
     }
   }
@@ -268,6 +276,12 @@ edoublearray delay_gamma(double mu,double shape,double tmax,double tstep)
 
 int emain()
 {
+  double finter=0.5;
+  double fintra=1.5;
+  epregister(finter);
+  epregister(fintra);
+  eparseArgs();
+
   eintarray agegroups;
 
   agegroups.init(18,500000);
@@ -289,23 +303,38 @@ int emain()
   eintarray H;
   H.init(agegroups.size(),0);
 
+  
 
 
 
+
+  // Ferguson et al 2006 has household distribution sizes in supplementary graphs which the values below approximate
   eintarray householdSizeDist;
   householdSizeDist.init(6,0.0); // how many households with single individuals, two individuals, ... max 6
   householdSizeDist[0]=0; // household with 0 susceptible
-  householdSizeDist[1]=0.20*popsize;
-  householdSizeDist[2]=0.20*popsize/2.0;
-  householdSizeDist[3]=0.30*popsize/3.0; // 3 individual households, e.g.: two adults one child
-  householdSizeDist[4]=0.20*popsize/4.0;
-  householdSizeDist[5]=0.10*popsize/5.0;
+  householdSizeDist[1]=0.31*popsize;      
+  householdSizeDist[2]=0.34*popsize/2.0;
+  householdSizeDist[3]=0.16*popsize/3.0; // 3 individual households, e.g.: two adults one child
+  householdSizeDist[4]=0.13*popsize/4.0;
+  householdSizeDist[5]=0.06*popsize/5.0;
 
   int total_households=0;
   for (int i=0; i<householdSizeDist.size(); ++i)
     total_households+=householdSizeDist[i];
 
   ssimstate st;
+
+  evarhash options;
+  options.add("header",1);
+
+  etable agegroup_infparams(etableLoad("data/agegroup.infparams",options));
+
+  cout <<  mularr(agegroup_infparams["Prop_symp_hospitalised"],agegroup_infparams["Prop_hospitalised_critical"]) << endl;
+  cout <<  mularr(agegroup_infparams["Prop_symp_hospitalised"]),addarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0)) << endl;
+  cout <<  edoublearray(agegroup_infparams["Prop_critical_fatal"]) << endl;
+  cout <<  edoublearray(agegroup_infparams["Prop_noncritical_fatal"]) << endl;
+//  cout << agegroup_infparams << endl;
+  exit(0);
 
 
   // from Davies et al. 2020 covidm_params.R 
@@ -333,8 +362,6 @@ int emain()
 
   st.dIpD=delay_gamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
 
-
-
   int nlevels=householdSizeDist.size()*(householdSizeDist.size()+1)/2;
   st.hhLevels.init(nlevels);
   st.hhIa.init(nlevels,0);
@@ -344,7 +371,7 @@ int emain()
 
   cout << "# total households: " << total_households << endl;
   st.households.init(total_households);
-  int hi=0;
+  int hi=0,ai=0;
   for (int i=0; i<householdSizeDist.size(); ++i){
     uint8_t hl=i*(i+1)/2+i;
     st.hhLevels[hl].reserve(householdSizeDist[i]);
@@ -356,17 +383,74 @@ int emain()
       st.households[hi].Is=0;
       st.households[hi].Ip=0;
       st.households[hi].E=0;
+      st.households[hi].ageind=ai;
+      ai+=i; // add size
     }
   }
   ldieif(hi!=total_households,"hi != total_households: "+estr(hi)+ " " + estr(total_households));
 
+
+
+  st.pop_ages.init(popsize,0);
+
+  
+  int assigned=0;
+  const int agegroupband=5; // years
+  eintarray tmpag(agegroups);
+  for (int i=householdSizeDist.size()-1; i>=1; --i){
+    uint8_t hl=i*(i+1)/2+i;
+    for (int j=0; j<st.hhLevels[hl].size(); ++j){
+      shousehold &sh(st.households[st.hhLevels[hl][j]]);
+      do {
+        st.pop_ages[sh.ageind]=5+(i-2)+rnd.uniform()*(tmpag.size()-5-3*(i-2));
+      } while (tmpag[st.pop_ages[sh.ageind]]==0);
+      --tmpag[st.pop_ages[sh.ageind]];
+      ++assigned;
+      if (i>1){
+        do {
+          st.pop_ages[sh.ageind+1]=st.pop_ages[sh.ageind]+int(rnd.uniform()*3)-2;
+        } while (tmpag[st.pop_ages[sh.ageind+1]]==0);
+        --tmpag[st.pop_ages[sh.ageind+1]];
+        ++assigned;
+      }   
+      // Children
+      for (int l=2; l<i; ++l){
+        do {
+          st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
+        } while (tmpag[st.pop_ages[sh.ageind+l]]==0);
+        --tmpag[st.pop_ages[sh.ageind+l]];
+        ++assigned;
+      }
+    }
+  }
+
+
+/*
+  for (int i=0; i<100; ++i){
+    int ri=rnd.uniform()*st.households.size();
+    shousehold &hh(st.households[ri]);
+    cout << estr().sprintf("%hi",hh.size);
+    for (int j=0; j<hh.size; ++j)
+      cout << "\t" << pop_ages[hh.ageind+j]*5;
+    cout << endl;
+  }
+*/
+
+  cout << "# done populating households: " << assigned << endl;
+
   st.evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
+
+  edoublearray mp;
+  euintarray counts;
 
   double fE=0.0; // fraction of exposed (includes deaths, active infections and healed)
 
-  st.allIp=3;
+  st.allE=3;
+  counts.init(3,0);
+  counts[1]=3;
+  st.evqueue.add(st,2,0,counts,st.dE,rnd);
 
-  cout << "Time" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << endl;
+  cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << endl;
   for (int it=0; it<1000; ++it){
 
     st.all_icu=0.0;
@@ -374,15 +458,12 @@ int emain()
 
     fE=double(st.allE)/popsize;
 
-    edoublearray mp;
-    euintarray counts;
-
     for (int hhsize=1; hhsize<householdSizeDist.size(); ++hhsize){
       for (int hhexp=0; hhexp<hhsize; ++hhexp){
         uint8_t hhstlevel=hhsize*(hhsize+1)/2+(hhsize-hhexp);
-        double interhhrate=(1.0-fE)*(0.5*st.allIa+0.5*st.allIp+st.allIs);
+        double interhhrate=finter*(1.0-fE)*(0.5*st.allIa+0.5*st.allIp+st.allIs);
         // The intra household rate below is an approximation needed to avoid computing the exact probability of new infection per household which depends on the specific combination of Ia,Is and Ip
-        double intrahhrate=(0.5*st.hhIa[hhstlevel]+0.5*st.hhIp[hhstlevel]+st.hhIs[hhstlevel]);
+        double intrahhrate=fintra*(0.5*st.hhIa[hhstlevel]+0.5*st.hhIp[hhstlevel]+st.hhIs[hhstlevel]);
 
         int hS=hhsize-hhexp;
         int nS=st.hhLevels[hhstlevel].size()*hS; // total number of susceptible people in these households
@@ -410,7 +491,7 @@ int emain()
       processEvents(st,nextEvents,rnd);
 //      st.allE+=nextEvents.size();
     }
-    cout << it*st.tstep << "\t" << st.allE << "\t" << st.allIa << "\t" << st.allIp << "\t" << st.allIs << "\t" << st.all_icu << "\t" << st.all_nonicu << endl;
+    cout << it*st.tstep << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allIa << "\t" << st.allIp << "\t" << st.allIs << "\t" << st.all_icu << "\t" << st.all_nonicu << endl;
 //   sleep(2);
   }
 
