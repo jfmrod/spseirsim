@@ -1,6 +1,6 @@
 LDLIBS=`eutils-config --libs`
 CXXFLAGS=`eutils-config --cxxflags` -g -O2
 
-all : covidsim
+all : seirsim
 
-covidsim : covidsim.cpp
+seirsim : seirsim.cpp
