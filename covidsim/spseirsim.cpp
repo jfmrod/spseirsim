@@ -31,7 +31,7 @@ int binomial(int n,double p,const ernd& r)
 
 void permute(ebasicarray<uint8_t>& pop_ages,int ind,int size,ernd& r){
   for (int i=0; i<size-1; ++i){
-    int ir=r.uniform()*size;
+    int ir=r.uniformint(size);
     if (ir==i) continue;
     swap(pop_ages[ind+i],pop_ages[ind+ir]);
   }
@@ -75,6 +75,7 @@ struct shousehold {
   uint8_t Ip;
   uint8_t Is;
   uint8_t hage;
+  int gridpos;
   int ageind;
 };
 
@@ -87,6 +88,28 @@ struct sevent {
 class evqueuelist;
 struct ssimstate;
 
+/*
+class elevel
+{
+ eintarray *inds;
+ unsigned int s;
+ unsigned int e;
+
+ eintarray li;
+ public:
+   elevel(eintarray *_inds,unsigned int _s, unsigned int _e): inds(_inds),s(_s),e(_e) { }
+   unsigned int swapleft(unsigned int p,unsigned int l) {
+     swap(&inds[s+li[l]],&inds[s+p]); // swap element with position of first element in the "level"
+     p=li[l];                         // update position of element
+     ++li[l];                         // increase level start to exclude the element we just move there
+   }
+   unsigned int swap(unsigned int p,unsigned int ol,unsigned int nl) {
+     for (;ol>nl; --ol)
+       p=swapleft(p,ol);
+     return(p);
+   }
+};
+*/
 
 class evqueuelist
 {
@@ -101,6 +124,17 @@ class evqueuelist
   void add(ssimstate& st,uint8_t hage,uint8_t hhsize,uint8_t hhexp,euintarray& count,const edoublearray& evdist,ernd& r,int ntransition=0);
   void add(ssimstate& st,sevent& ev,int newt);
   void resize(int newsize);
+};
+
+struct sgrid
+{
+  int N;
+  int Ia;
+  int Ip;
+  int Is;
+  int oIa;
+  int oIp;
+  int oIs;
 };
 
 struct ssimstate {
@@ -140,10 +174,15 @@ struct ssimstate {
   edoublearray death_icu;
   edoublearray death_nonicu;
 
+
+  ebasicarray<sgrid> spGrid;
+
   ebasicarray<uint8_t> pop_ages;
   ebasicarray<shousehold> households;
 
-  earray<earray<deque<int> > > hhLevels;
+  eintarray hhLevels2;
+  earray<eintarray> hhLevelsBegin;
+//  earray<earray<deque<int> > > hhLevels;
   earray<eintarray> hhIa,hhIp,hhIs;
 
   int allE=0,allIp=0,allIs=0,allIa=0;
@@ -165,19 +204,25 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         if (rnd.uniform()<st.rSA){
           // E -> Ip
           ++st.allIp;
-          if (hs.hage>=10)
+          if (hs.hage>=10){
             ++st.oallIp;
+            ++st.spGrid[hs.gridpos].oIp;
+          }
           ++st.hhIp[hs.hage][hhl];
           ++hs.Ip;
+          ++st.spGrid[hs.gridpos].Ip;
           e.transition=2;
           st.evqueue.add(st,e,st.rIp(r));
         }else{
           // E -> Ia
           ++st.allIa;
-          if (hs.hage>=10)
+          if (hs.hage>=10){
             ++st.oallIa;
+            ++st.spGrid[hs.gridpos].oIa;
+          }
           ++st.hhIa[hs.hage][hhl];
           ++hs.Ia;
+          ++st.spGrid[hs.gridpos].Ia;
           e.transition=1;
           st.evqueue.add(st,e,st.rIa(r));
         }
@@ -188,10 +233,13 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         shousehold &hs(st.households[e.hhid]);
         uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
         --st.allIa;
-        if (hs.hage>=10)
-           --st.oallIa;
+        if (hs.hage>=10){
+          --st.oallIa;
+          --st.spGrid[hs.gridpos].oIa;
+        }
         --st.hhIa[hs.hage][hhl];
         --hs.Ia;
+        --st.spGrid[hs.gridpos].Ia;
        break;
       }
       case 2:{
@@ -201,13 +249,17 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         --st.allIp;
         --st.hhIp[hs.hage][hhl];
         --hs.Ip;
+        --st.spGrid[hs.gridpos].Ip;
         if (hs.hage>=10){
            --st.oallIp;
+           --st.spGrid[hs.gridpos].oIp;
            ++st.oallIs;
+           ++st.spGrid[hs.gridpos].oIs;
         }
         ++st.allIs;
         ++st.hhIs[hs.hage][hhl];
         ++hs.Is;
+        ++st.spGrid[hs.gridpos].Is;
         e.transition=3;
         st.evqueue.add(st,e,st.rIs(r));
         double rf=rnd.uniform();
@@ -236,11 +288,14 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         // Ip -> 
         shousehold &hs(st.households[e.hhid]);
         uint8_t hhl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
-        if (hs.hage>=10)
-           --st.oallIs;
+        if (hs.hage>=10){
+          --st.oallIs;
+          --st.spGrid[hs.gridpos].oIs;
+        }
         --st.allIs;
         --st.hhIs[hs.hage][hhl];
         --hs.Is;
+        --st.spGrid[hs.gridpos].Is;
        break;
       }
       case 4:{
@@ -320,27 +375,17 @@ void evqueuelist::add(ssimstate &st,uint8_t hage,uint8_t hhsize,uint8_t hhexp,eu
     multinomial(count[ic],evdist,tmpres,r);
     for (int i=0; i<tmpres.size(); ++i){
       for (int j=0; j<tmpres[i]; ++j){
-        ldieif(st.hhLevels[hage][hl].size()==0,"hhLevels empty!");
+//        ldieif(st.hhLevels[hage][hl].size()==0,"hhLevels empty!");
+        unsigned int hlb=st.hhLevelsBegin[hage][hl];
+        unsigned int hlcount=st.hhLevelsBegin[hage][hl+1]-st.hhLevelsBegin[hage][hl];
+        lddieif(hlcount,"hhLevels empty!");
 
         // choose a random household
-        int ri=r.uniform()*st.hhLevels[hage][hl].size();
-        ldieif(ri>=st.hhLevels[hage][hl].size(),"ri > array");
+        int ri=r.uniformint(hlcount);
 
-        ev.hhid=st.hhLevels[hage][hl][ri];
-        if (ri!=st.hhLevels[hage][hl].size()-1)
-          swap(st.hhLevels[hage][hl][ri],st.hhLevels[hage][hl][st.hhLevels[hage][hl].size()-1]);
-        st.households[st.hhLevels[hage][hl][ri]].hstind=ri;
-
-//        st.hhLevels[hl].erase(st.hhLevels[hl].size()-1);
-        st.hhLevels[hage][hl].pop_back();;
-       
-        shousehold &hst(st.households[ev.hhid]);
-        ldieif(hst.hage!=hage,"mismatching hages!");
-
-        // remove Ia, Ip, and Is counts from previous level
-        st.hhIa[hage][hl]-=hst.Ia;
-        st.hhIp[hage][hl]-=hst.Ip;
-        st.hhIs[hage][hl]-=hst.Is;
+        unsigned int hhid=st.hhLevels2[hlb+ri];
+        ev.hhid=hhid;
+        shousehold &hst(st.households[hhid]);
 
         if (hst.size != hhsize || hst.E != hhexp){
           printf("wrong transition: hst.size: %hhi hhsize: %hhi hst.E: %hhi hhexp: %hhi hhstlevel: %hhi\n",hst.size,hhsize,hst.E,hhexp,hl);
@@ -351,8 +396,31 @@ void evqueuelist::add(ssimstate &st,uint8_t hage,uint8_t hhsize,uint8_t hhexp,eu
           printf("household exposed larger than household size: hst.E: %hhi hst.size: %hhi hhsize: %hhi hhexp: %hhi ic: %i count.size(): %i\n",hst.E,hst.size,hhsize,hhexp,ic,count.size());
           exit(0);
         }
-        hst.hstind=st.hhLevels[hage][hlnew].size();
-        st.hhLevels[hage][hlnew].push_back(ev.hhid);
+
+        // this code is implemented like this for efficiency reasons
+        // all households indices in the different levels are all stored in a single large array grouped by levels
+        // the start of each subarray level is stored in the hhLevelsBegin array
+        // to move a household to another level, I just swap the household to the beginning of the level subarray
+        // and then increment the beginning of that subarray level, effectively removing it from the current level to the previous one
+        // each level corresponds to a different number of exposed individuals in the households
+        for (int l=0; l<ic; ++l){
+          // move household chosen to beginning of level
+          if (ri>0)
+            swap(st.hhLevels2[hlb],st.hhLevels2[hlb+ri]); 
+          st.households[st.hhLevels2[hlb+ri]].hstind=ri; // update position of not chosen but swapped household
+          ++st.hhLevelsBegin[hage][hl];
+          ri=st.hhLevelsBegin[hage][hl]-st.hhLevelsBegin[hage][hl-1]-1;
+          hst.hstind=ri; // update position of moved household, to end of lower level
+          --hl;
+          hlb=st.hhLevelsBegin[hage][hl];
+        }
+
+        lddieif(hst.hage!=hage,"mismatching hages!");
+
+        // remove Ia, Ip, and Is counts from previous level
+        st.hhIa[hage][hl]-=hst.Ia;
+        st.hhIp[hage][hl]-=hst.Ip;
+        st.hhIs[hage][hl]-=hst.Is;
 
         // add Ia, Ip, and Is counts to new level
         st.hhIa[hage][hlnew]+=hst.Ia;
@@ -552,14 +620,15 @@ int emain()
   st.dIpD=delay_gamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
 */
 
-  st.hhLevels.init(agegroups.size());
+  st.hhLevels2.init(total_households);
+  st.hhLevelsBegin.init(agegroups.size());
   st.hhIa.init(agegroups.size());
   st.hhIp.init(agegroups.size());
   st.hhIs.init(agegroups.size());
 
   int nlevels=householdSizeDist.size()*(householdSizeDist.size()+1)/2;
   for (int i=0; i<agegroups.size(); ++i){
-    st.hhLevels[i].init(nlevels);
+    st.hhLevelsBegin[i].init(nlevels+1,0); // need one more level for storing the total size of the subarray, this avoids having to use a special case for beginning or end of the level subarrays 
     st.hhIa[i].init(nlevels,0);
     st.hhIp[i].init(nlevels,0);
     st.hhIs[i].init(nlevels,0);
@@ -615,7 +684,7 @@ int emain()
       shousehold &sh(st.households[hhlist[i][j]]);
       do {
         ldieif(sh.ageind<0 || sh.ageind>=st.pop_ages.size(),"out of bounds: "+estr(sh.ageind)+" "+st.pop_ages.size());
-        st.pop_ages[sh.ageind]=int(5+(i-2)*0.5)+rnd.uniform()*(tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2)));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
+        st.pop_ages[sh.ageind]=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
         ldieif(st.pop_ages[sh.ageind]<0 || st.pop_ages[sh.ageind]>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.pop_ages[sh.ageind])+" "+tmpag.size());
 //        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
       } while (tmpag[st.pop_ages[sh.ageind]]==0);
@@ -631,7 +700,7 @@ int emain()
       if (i>1){
         do {
           ldieif(sh.ageind+1<0 || sh.ageind+1>=st.pop_ages.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.pop_ages.size());
-          st.pop_ages[sh.ageind+1]=minint(st.pop_ages[sh.ageind]+int(rnd.uniform()*3)-2,tmpag.size()-1);
+          st.pop_ages[sh.ageind+1]=minint(st.pop_ages[sh.ageind]+int(rnd.uniformint(3))-2,tmpag.size()-1);
           ldieif(st.pop_ages[sh.ageind+1]<0 || st.pop_ages[sh.ageind+1]>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.pop_ages[sh.ageind+1])+" "+tmpag.size());
         } while (tmpag[st.pop_ages[sh.ageind+1]]==0);
         --tmpag[st.pop_ages[sh.ageind+1]];
@@ -643,11 +712,11 @@ int emain()
       for (int l=2; l<i; ++l){
         do {
           if (tmpag[MAX(0,st.pop_ages[sh.ageind]-9)]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+1]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+2]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+3]==0)
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + 4 + int(rnd.uniform()*3);
+            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + 4 + int(rnd.uniformint(3));
           else if (tmpag[MAX(0,st.pop_ages[sh.ageind]-9)]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+1]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+2]==0)
             st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + 3;
           else
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + int(rnd.uniform()*3);
+            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + int(rnd.uniformint(3));
 /*
           if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
             st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
@@ -669,13 +738,33 @@ int emain()
   int hhOlderNY=0;
   int hhYoungNO=0;
   int hhYoungNY=0;
-   for (int i=1; i<hhlist.size(); ++i){
+
+  eintarray hhagecount;
+  hhagecount.init(agegroups.size(),0);
+  for (int i=0; i<st.households.size(); ++i){
+    shousehold &hh(st.households[i]);
+    ++hhagecount[hh.hage];
+  }
+
+  // initializes the start of each hhLevel subarray inside the large single array using the number of households per segment
+  for (int hage=0,ipos=0; hage<st.hhLevelsBegin.size(); ++hage){
+    for (int j=0; j<st.hhLevelsBegin[hage].size(); ++j)
+      st.hhLevelsBegin[hage]=ipos;
+    ipos+=hhagecount[hage];
+  }
+
+  // populate hhLevels
+  for (int i=1; i<hhlist.size(); ++i){
     uint8_t hl=i*(i+1)/2+i;
     for (int j=0; j<hhlist[i].size(); ++j){
       shousehold &sh(st.households[hhlist[i][j]]);
-      uint8_t *agearr=&st.pop_ages[sh.ageind];
       int hage=sh.hage;
-      st.hhLevels[hage][hl].push_back(hhlist[i][j]);
+
+      // store household indice in levels array
+      st.hhLevels2[st.hhLevelsBegin[hage][hl+1]]=hhlist[i][j];
+      ++st.hhLevelsBegin[hage][hl+1]; // end of subarray is beginning of the next level
+
+      uint8_t *agearr=&st.pop_ages[sh.ageind];
       if (hage>=10){
         ++hhOlder;
         hhOlderN+=i;
@@ -697,7 +786,6 @@ int emain()
   }
 
 
-
   cout << "# hhOlder: " << hhOlder << " (" << double(hhOlder)/total_households << ")" << endl;
   cout << "# hhOlderN: " << hhOlderN << " (" << double(hhOlderN)/popsize << ")" << endl;
   cout << "# hhOlderNO: " << hhOlderNO << " (" << double(hhOlderNO)/popsize << ")" << endl;
@@ -715,6 +803,29 @@ int emain()
       permute(st.pop_ages,hh.ageind,hh.size,rnd);
     }
   }
+
+
+  st.spGrid.init(100*100); // init 100 x 100 grid
+  for (int i=0; i<100*100; ++i){
+    st.spGrid[i].N=0;
+    st.spGrid[i].Ip=0;
+    st.spGrid[i].Is=0;
+    st.spGrid[i].Ia=0;
+    st.spGrid[i].oIp=0;
+    st.spGrid[i].oIs=0;
+    st.spGrid[i].oIa=0;
+  }
+
+  // randomly place households across grid
+  for (int i=0; i<st.households.size(); ++i){
+    shousehold &hh(st.households[i]);
+    hh.gridpos=rnd.uniformint(100*100);
+    st.spGrid[hh.gridpos].N+=hh.size;
+  }
+
+//  for (int i=0; i<st.spGrid.size(); ++i){
+//    cout << st.spGrid[i].N << endl;
+//  }
 
 
 
@@ -796,24 +907,47 @@ int emain()
 
     // The hhOlderN term is needed to prevent R0 from decreasing when older population is isolated from younger population
     // Whithout including this term, the simulation is equivalent to an older population considered immune but still interacting, thus reducing incorrectly the R0
-    double interIprob=finter*R0day*(0.5*st.allIa+st.allIp+st.allIs - (1.0-MIN(smr,soldr)/smr)*(0.5*st.oallIa+st.oallIp+st.oallIs) )/(popsize-(1.0-MIN(smr,soldr)/smr)*hhOlderN);
-    if (interIprob>1.0) interIprob=1.0; // The reason to cap the probability is to prevent it from overwhelming the "isolation" factor below. But need to consider the wider implication of this
+
+    // Global probability of infection from random person in country (x0.01)
+    double globalIprob=0.01*finter*R0day*(0.5*st.allIa+st.allIp+st.allIs - (1.0-MIN(smr,soldr)/smr)*(0.5*st.oallIa+st.oallIp+st.oallIs) )/(popsize-(1.0-MIN(smr,soldr)/smr)*hhOlderN);
+    if (globalIprob>1.0) globalIprob=1.0; // The reason to cap the probability is to prevent the unrealistic situation where "isolation" has no effect on the probability of infection. Need to consider more carefully  what capping this value implies in the model and what the wider implications are
+    // The cap means that the maximum probability of getting infected per day cannot be larger than 1, and because of this a mitigation factor of 50% will
+    // guarantee a reduction in 50% probability of getting infected. This however implies there is a saturation of the probability of infection, 
+    // To put this more mechanistically: if we assume isolation reduces the time a person spends with other contacts or number of contacts (with constant time per contact), and we assume the probability of infection is proportional to the time exposed to an infected individual. Then isolation will always have an effect on probability of infection.
+    // There are cases when this is not true, if the probability of infection is so high that it is enough to have a single contact even of very short duration to have a probability of 100% of getting infected and the proportion of infected is high enough to guarantee there is one infected person in almost every group of contacts, then reducing contact (either by decreasing the time or by decreasing the number of contacts) should correctly result in no reduced probability of infection.
 
     fE=double(st.allE)/popsize;
+
+
+//    for (int gi=0; gi<st.spGrid.size(); ++gi){
+//      sgrid &sg(st.spGrid[gi]);
+//      double localIprob=st.tstep*finter*R0day*(0.5*sg.Ia+sg.Ip+sg.Is)/sg.N;
+///*
+//      double localIprob=st.tstep*finter*R0day*(0.5*sg.Ia+sg.Ip+sg.Is - (1.0-MIN(smr,soldr)/smr)*(0.5*sg.oIa+sg.oIp+sg.oIs) )/(sg.N-(1.0-MIN(smr,soldr)/smr)*sg.OlderN);
+//      // probability of infection for individuals in isolated houses
+//      double localOIprob=st.tstep*MIN(smr,soldr)*R0day*(0.5*sg.Ia+sg.Ip+sg.Is - (1.0-MIN(smr,soldr)/smr)*(0.5*sg.oIa+sg.oIp+sg.oIs) )/(sg.N-(1.0-MIN(smr,soldr)/smr)*sg.OlderN);
+//      if (smr <= soldr){ // older and younger have same probability
+//      }else{
+//      }
+//*/
+//    }
+
+
     for (int hage=0; hage<agegroups.size(); ++hage){
       for (int hhsize=1; hhsize<householdSizeDist.size(); ++hhsize){
         for (int hhexp=hhsize-1; hhexp>=0; --hhexp){ // have to do decreasing here to avoid double infecting the same houses in the same step
 
           uint8_t hl=hhsize*(hhsize+1)/2+(hhsize-hhexp);
-          if (st.hhLevels[hage][hl].size()==0) continue;
+          unsigned int hlcount=st.hhLevelsBegin[hage][hl+1]-st.hhLevelsBegin[hage][hl];
+          if (hlcount==0) continue; // no households in level
 
           int hS=hhsize-hhexp; // number of susceptible individuals per household
-          int nS=st.hhLevels[hage][hl].size()*hS; // total number of susceptible individuals in these households
+          int nS=hlcount*hS; // total number of susceptible individuals in these households
 
           // The intra household rate below is an approximation needed to avoid computing the exact probability of new infection per household which depends on the specific combination of Ia,Is and Ip
           double intraIprob=fintra*R0day*(0.5*st.hhIa[hage][hl]+st.hhIp[hage][hl]+st.hhIs[hage][hl])/nS;
   
-          double p=(MIN(smr,(hage>=10?soldr:1.0))*interIprob + intraIprob)*st.tstep; // probability of infection per susceptible person in these households
+          double p=(MIN(smr,(hage>=10?soldr:1.0))*globalIprob + intraIprob)*st.tstep; // probability of infection per susceptible person in these households
           if (p*hS>1.0) p=1.0/hS; // The reason to cap the probability is to prevent it from overwhelming the "isolation" factor below. But need to consider the wider implication of this
   
           mp.clear();
@@ -827,7 +961,7 @@ int emain()
 //          }
           mp[0]=1.0-mp[0]; // probability of household having no infection
           counts.init(mp.size(),0);
-          multinomial(st.hhLevels[hage][hl].size(),mp,counts,rnd);
+          multinomial(hlcount,mp,counts,rnd);
          
   //        int newE=binomial(nS,,rnd)/(hhsize-hhexp);
   //        if (newE>st.hhLevels[hhstlevel].size()) newE=st.hhLevels[hhstlevel].size(); // cap maximum number of new household exposures
