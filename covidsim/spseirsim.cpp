@@ -185,7 +185,9 @@ struct ssimstate {
 
 //  const int ngroups=2; // defined as global now
 
-  const int spGridSize=100;
+  int spGridW=0;
+  int spGridH=0;
+  int spGridSize=0;
   ebasicarray<sgrid> spGrid;
 
   ebasicarray<uint8_t> pop_ages;
@@ -454,6 +456,8 @@ edoublearray delay_gamma(double mu,double shape,double tmax,double tstep)
 }
 
 void colorRect(uint8_t *frameRaw,int xb,int yb,int xe,int ye,uint32_t color,int prow){
+  if (xb>xe) swap(xb,xe);
+  if (yb>ye) swap(yb,ye);
   for (int ty=yb; ty<ye; ++ty){
     for (int tx=xb; tx<xe; ++tx){
       int p=ty*prow*4+tx*4;
@@ -532,35 +536,66 @@ static int GTIFReportACorner( GTIF *gtif, GTIFDefn *defn, FILE * fp_out, const c
   return 0;
 }
 
-static void GTIFPrintCorners(GTIF *gtif, GTIFDefn *defn, FILE * fp_out,int xsize, int ysize)
-{
-  printf( "\nCorner Coordinates:\n" );
 
-  unsigned short raster_type = RasterPixelIsArea;
-  GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &raster_type, 0, 1);
+GTIF *gtif=0x00;
+float nodataval=0.0;
+float *raster=0x00;
+int rwidth=0;
+int rheight=0;
+float rmaxpop=0.0;
+int rpopsize=0;
 
-  double xmin = (raster_type == RasterPixelIsArea) ? 0.0 : -0.5;
-  double ymin = xmin;
-  double ymax = ymin + ysize;
-  double xmax = xmin + xsize;
-
-  if( GTIFReportACorner( gtif, defn, fp_out,"Upper Left", xmin, ymin) == -1 )
-  {
-      printf( " ... unable to transform points between pixel/line and PCS space\n" );
-      return;
-  }
-
-  GTIFReportACorner( gtif, defn, fp_out, "Lower Left", xmin, ymax);
-  GTIFReportACorner( gtif, defn, fp_out, "Upper Right", xmax, ymin);
-  GTIFReportACorner( gtif, defn, fp_out, "Lower Right", xmax, ymax);
-  GTIFReportACorner( gtif, defn, fp_out, "Center", xmin + xsize/2.0, ymin + ysize/2.0);
+/*
+inline float readPopDens(double lon,double lat){
+  GTIFPCSToImage( gtif, &lon,&lat );
+  return(raster[uint32_t(lat)*rwidth + uint32_t(lon)]==nodataval?0.0:raster[uint32_t(lat)*rwidth + uint32_t(lon)]);
 }
+*/
+
+inline float readPopDensR(uint32_t ix,uint32_t iy){
+  return(raster[iy*rwidth + ix]==nodataval?0.0:raster[iy*rwidth + ix]);
+}
+
+
 
 uint32_t v3_col(const evector3& v){ return(0xFFu&uint32_t(v.x*0xFFu) | 0xFF00u&uint32_t(v.y*0xFF00u) | 0xFF0000u&uint32_t(v.z*0xFF0000)); }
 
 uint32_t tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
   evector3 col12=col1*(1.0-p1)+col2*p1;
   return(v3_col((col1*(1.0-p1)+col2*p1)*(1.0-p2)+col3*p2));
+}
+
+
+double lonMin=0.0;
+double lonMax=0.0;
+double lonRef=0.0;
+
+double proj(double lon,double lat,double reflon){
+  return(cos(M_PI*lat/180.0)*(lon-reflon));
+}
+
+double scale=1.0;
+double xpos=0.0,ypos=0.0;
+
+double revproj(double lon,double lat,double reflon){
+  return(lon/cos(M_PI*lat/180.0)+reflon + lonMin);
+}
+
+void cairoDrawShape(cairo_t *cr,SHPObject *shp){
+  for (int j=0, iPart=1; j<shp->nVertices; ++j){
+    if (j == 0 && shp->nParts > 0 )
+      cairo_move_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
+            
+    if (iPart < shp->nParts && shp->panPartStart[iPart]==j){
+      cairo_close_path(cr);
+      cairo_move_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
+//      pszPartType = SHPPartTypeName( psShape->panPartType[iPart] );
+      iPart++;
+    }else
+      cairo_line_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+  }
 }
 
 
@@ -573,27 +608,57 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
     frameRaw[i+3]=0x00;
   }
 
+  if ((lonMax-lonMin)/(psShape->dfYMax-psShape->dfYMin) > double(width)/height){
+    scale=width/(lonMax-lonMin);
+    ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
+  }else{
+    scale=height/(psShape->dfYMax-psShape->dfYMin);
+    xpos=(width-scale*(lonMax-lonMin))/2.0;
+  }
+  scale=0.9*scale;
+  ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
+  xpos=(width-scale*(lonMax-lonMin))/2.0;
+
   double maxE=0.0;
   double maxI=0.0;
   for (int i=0; i<st.spGridSize; ++i){
-    for (int j=0; j<st.spGridSize; ++j){
-      sgrid &g(st.spGrid[j*st.spGridSize+i]);
-      double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
-      double tmpE=double(g.E)/(g.N[0]+g.N[1]);
-      if (maxI<tmpI) maxI=tmpI;
-      if (maxE<tmpE) maxE=tmpE;
-    }
+    sgrid &g(st.spGrid[i]);
+    double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
+    double tmpE=double(g.E)/(g.N[0]+g.N[1]);
+    if (maxI<tmpI) maxI=tmpI;
+    if (maxE<tmpE) maxE=tmpE;
   }
-  for (int i=0; i<st.spGridSize; ++i){
-    for (int j=0; j<st.spGridSize; ++j){
-      sgrid &g(st.spGrid[j*st.spGridSize+i]);
+
+  for (int i=0; i<st.spGridW; ++i){
+    for (int j=0; j<st.spGridH; ++j){
+      double sxlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double sylat=j*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+      double xlon=(i-0.5)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylat=(j-0.5)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+      double xlonn=(i+1-0.5)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylatn=(j+1-0.5)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+      double sx=scale*(proj(xlon,ylat,lonRef)-lonMin)+xpos;
+      double sy=1080.0-scale*(ylat-psShape->dfYMin)-ypos;
+//      cout << "i: " << i << " j: " << j << " xlonylat: " << xlon << " " << ylat << " sxsy: " << sx << " " << sy <<endl;
+
+      double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos;
+      double syn=1080.0-scale*(ylatn-psShape->dfYMin)-ypos;
+
+      sgrid &g(st.spGrid[j*st.spGridW+i]);
       double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
       double tmpE=double(g.E)/(g.N[0]+g.N[1]);
-      uint32_t color=tricolor(evector3(1.0,1.0,1.0),evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,rheight-j)+0.001)-log(0.001))/(log(rmaxpop+0.001)-log(0.001))*0.6+0.4);
+//      float pdens=clamp(0.0,1.0,readPopDensR(i+rxmin,rymax-j)/maxpdens*0.6+0.4);
+//      float pdens=clamp(0.0,1.0,readPopDens(i*(psShape->dfXMax-psShape->dfXMin)/100.0+psShape->dfXMin,j*(psShape->dfYMax-psShape->dfYMin)/100.0+psShape->dfYMin)/maxpdens);
+      uint32_t color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
 //      uint32_t color=0xFFFFFFu;
-      colorRect(frameRaw,(1920-1080)/2+i*1080/100,j*1080/100,(1920-1080)/2+(i+1)*1080/100,(j+1)*1080/100,color,width);
+      colorRect(frameRaw,sx,sy,sxn,syn,color,width);
     }
   }
+
 
 /*
   for (int i=(1920-1080)*4/2; i<width-(1920-1080)*4/2; ++i){
@@ -617,37 +682,10 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
   // tell cairo we have changed the image contents
   cairo_surface_mark_dirty(surface);
 
-  double scale;
-  double xpos=0.0,ypos=0.0;
-  if ((psShape->dfXMax-psShape->dfXMin)/(psShape->dfYMax-psShape->dfYMin) > double(width)/height){
-    scale=width/(psShape->dfXMax-psShape->dfXMin);
-    ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
-  }else{
-    scale=height/(psShape->dfYMax-psShape->dfYMin);
-    xpos=(width-scale*(psShape->dfXMax-psShape->dfXMin))/2.0;
-  }
-  scale=0.9*scale;
-  ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
-  xpos=(width-scale*(psShape->dfXMax-psShape->dfXMin))/2.0;
-
-  for (int j=0, iPart=1; j<psShape->nVertices; ++j){
-    if (j == 0 && psShape->nParts > 0 )
-      cairo_move_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
-//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
-            
-    if (iPart < psShape->nParts && psShape->panPartStart[iPart]==j){
-      cairo_close_path(cr);
-      cairo_move_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
-//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
-//      pszPartType = SHPPartTypeName( psShape->panPartType[iPart] );
-      iPart++;
-    }else
-      cairo_line_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
-  }
+  cairoDrawShape(cr,psShape);
   cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_set_line_width(cr, 1);
   cairo_stroke (cr);
-
 
   cairo_move_to (cr, 10.0, 50.0);
   cairo_show_text (cr, (estr("Day: ")+day)._str);
@@ -670,6 +708,8 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
   videoPushFrame(frameRaw);
 }
 
+uint8_t *shapeMask=0x00;
+
 void initCairo(uint8_t *frameRaw,int width,int height)
 {
 //  cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_RGB32, width, height);
@@ -683,13 +723,77 @@ void initCairo(uint8_t *frameRaw,int width,int height)
   cairo_select_font_face (cr, "serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
   cairo_set_font_size (cr, 32.0);
   cairo_set_source_rgb (cr, 0.0, 0.0, 1.0);
+
+  cairo_surface_t *surfacemask=0x00;
+  cairo_t *crmask=0x00;
+
+
+  shapeMask=new uint8_t[rwidth*rheight];
+  memset(shapeMask,0,rwidth*rheight);
+  surfacemask=cairo_image_surface_create_for_data(shapeMask,CAIRO_FORMAT_A8,rwidth,rheight,rwidth);
+  cstatus=cairo_surface_status(surfacemask);
+  ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
+  crmask=cairo_create(surfacemask); 
+  cairoDrawShape(crmask,psShape);
+  cairo_set_source_rgb(crmask,1.0,1.0,1.0);
+  cairo_fill(crmask);
+  cairo_surface_flush(surfacemask);
+  cairo_destroy(crmask);
+  cairo_surface_destroy(surfacemask);
 }
 
-int loadPopDens(const estr& fname){
-  GTIF *gtif=0x00;
+#include <byteswap.h>
+
+#ifndef TIFFTAG_GDAL_NODATA
+#define TIFFTAG_GDAL_NODATA 42113
+#endif
+
+static const TIFFFieldInfo xgdaltiffFieldInfo[] = {
+  /* XXX Insert Your tags here */
+    { TIFFTAG_GDAL_NODATA,	-1,-1, TIFF_ASCII,	FIELD_CUSTOM,
+      1,	0,	"GDAL nodata" }
+};
+
+#define	TIFF_N(a)	(sizeof (a) / sizeof (a[0]))
+
+static TIFFExtendProc _ParentExtender = NULL;
+
+static void _XTIFFDefaultDirectory(TIFF *tif)
+{
+    /* Install the extended Tag field info */
+    TIFFMergeFieldInfo(tif, xgdaltiffFieldInfo, TIFF_N(xgdaltiffFieldInfo));
+
+    /* Since an XTIFF client module may have overridden
+     * the default directory method, we call it now to
+     * allow it to set up the rest of its own methods.
+     */
+
+    if (_ParentExtender) 
+        (*_ParentExtender)(tif);
+}
+
+static void _XTIFFInitialize(void)
+{
+    static int first_time=1;
+	
+    if (! first_time) return; /* Been there. Done that. */
+    first_time = 0;
+	
+    /* Grab the inherited method and install */
+    _ParentExtender = TIFFSetTagExtender(_XTIFFDefaultDirectory);
+}
+
+
+
+int loadPopDens(const estr& fname,int popsize){
+  _XTIFFInitialize(); // needed to setup GDAL novalue TAG info for TIFF, should just use the GDAL library for this
+
   TIFF *tif=0x00;
   tif=XTIFFOpen(fname._str,"r");
   if (!tif) return(-1);
+
+  /* Install the extended Tag field info */
+  TIFFMergeFieldInfo(tif, xgdaltiffFieldInfo, TIFF_N(xgdaltiffFieldInfo));
 	
   gtif = GTIFNew(tif);
   if (!gtif) {
@@ -699,15 +803,23 @@ int loadPopDens(const estr& fname){
 
   GTIFPrint(gtif,0,0);
 
-  int xsize, ysize;
+  uint32_t ysize=0; //xsize declared above
+  uint32_t xsize=0;
   TIFFGetField( tif, TIFFTAG_IMAGEWIDTH, &xsize );
   TIFFGetField( tif, TIFFTAG_IMAGELENGTH, &ysize );
-  int spp=0,sf=0,depth=0,bps=0;
+  uint32_t spp=0,sf=0,depth=0,bps=0,rowsperstrip=0;
   TIFFGetField( tif, TIFFTAG_BITSPERSAMPLE, &bps );
   TIFFGetField( tif, TIFFTAG_IMAGEDEPTH, &depth );
   TIFFGetField( tif, TIFFTAG_SAMPLESPERPIXEL, &spp );
   TIFFGetField( tif, TIFFTAG_SAMPLEFORMAT, &sf );
-  cout << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << endl;
+  TIFFGetField( tif, TIFFTAG_ROWSPERSTRIP, &rowsperstrip);
+
+  char *tnodataval=0x00;
+  TIFFGetField( tif, TIFFTAG_GDAL_NODATA, &tnodataval);
+  nodataval=estr(tnodataval).f();
+  
+
+  cout << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << " rowsperstrip: " << rowsperstrip << endl;
 
   GTIFDefn defn;
   if (GTIFGetDefn(gtif, &defn)){
@@ -716,19 +828,133 @@ int loadPopDens(const estr& fname){
 
     printf( "\n" );
     printf( "PROJ.4 Definition: %s\n", GTIFGetProj4Defn(&defn));
-            
-    GTIFPrintCorners( gtif, &defn, stdout, xsize, ysize);
   }
 
-	int npixels = xsize * ysize;
-	uint32_t *raster = (uint32*) _TIFFmalloc(npixels * sizeof (uint32));
+//  TIFFSetErrorHandler(TIFFError);
+
+//	if (!TIFFReadRGBAImage(tif, xsize, ysize, raster, 0)) { lerror("reading TIFF data"); exit(-1); return(-1); }
+
+
+  printf( "\nCorner Coordinates:\n" );
+
+  unsigned short raster_type = RasterPixelIsArea;
+  GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &raster_type, 0, 1);
+
+  double xmin = (raster_type == RasterPixelIsArea) ? 0.0 : -0.5;
+  double ymin = xmin;
+  double ymax = ymin + ysize;
+  double xmax = xmin + xsize;
+
+  ldieif(defn.Model != ModelTypeGeographic,"model used in GeoTIFF not implemented");
+//  cout << "defn->model is ModelTypeGeographic? " << (defn.Model == ModelTypeGeographic) << endl; 
+
+  double c_ul_x=xmin,c_ul_y=ymin;
+  double c_bl_x=xmin,c_bl_y=ymax;
+  double c_ur_x=xmax,c_ur_y=ymin;
+  double c_br_x=xmax,c_br_y=ymax;
+  if ( !GTIFImageToPCS( gtif, &c_ul_x, &c_ul_y ) )
+    return -1;
+  GTIFImageToPCS( gtif, &c_bl_x, &c_bl_y );
+  GTIFImageToPCS( gtif, &c_ur_x, &c_ur_y );
+  GTIFImageToPCS( gtif, &c_br_x, &c_br_y );
+
+  cout << "upper left: " << c_ul_x << " " << c_ul_y << endl;
+  cout << "upper right: " << c_ur_x << " " << c_ur_y << endl;
+  cout << "bottom left: " << c_bl_x << " " << c_bl_y << endl;
+  cout << "bottom right: " << c_br_x << " " << c_br_y << endl;
+
+  uint32_t rxmin=0;
+  uint32_t rxmax=0;
+  uint32_t rymin=0;
+  uint32_t rymax=0;
+
+  double sX=psShape->dfXMin;
+  double sY=psShape->dfYMin;
+  cout << "top left of shape: " << sX << " " << sY << endl;
+  GTIFPCSToImage( gtif, &sX,&sY );
+  cout << "top left of shape: " << sX << " " << sY << endl;
+//  cout << "value: " << raster[uint32_t(sY)*xsize + uint32_t(sX)] << " nodataval: " << nodataval << endl;
+  rxmin=sX;
+  rymin=sY;
+
+  sX=psShape->dfXMax;
+  sY=psShape->dfYMax;
+  cout << "bottom right of shape: " << sX << " " << sY << endl;
+  GTIFPCSToImage( gtif, &sX,&sY );
+  cout << "bottom right of shape: " << sX << " " << sY << endl;
+//  cout << "value: " << raster[uint32_t(sY)*xsize + uint32_t(sX)] << " nodataval: " << nodataval << endl;
+  rxmax=sX;
+  rymax=sY;
+
+  if (rxmin>rxmax) swap(rxmin,rxmax);
+  if (rymin>rymax) swap(rymin,rymax);
+  cout << "sxmin: " << rxmin << " sxmax: " << rxmax <<endl;
+  cout << "symin: " << rymin << " symax: " << rymax <<endl;
+  rwidth=rxmax-rxmin;
+  rheight=rymax-rymin;
+  cout << "rwidth: " << rwidth << " rheight: " << rheight <<endl;
+ 
+	int npixels = rwidth * rheight;
+	raster = (float*) _TIFFmalloc(npixels * sizeof (float));
 	if (raster == NULL) return(-1);
 
-	if (!TIFFReadRGBAImage(tif, xsize, ysize, raster, 0)) return(-1);
 
-//  _TIFFfree(raster);
+  uint32_t config=0u;
+  TIFFGetField(tif, TIFFTAG_PLANARCONFIG, &config);
+  ldieif(config!=PLANARCONFIG_CONTIG,"separate planes in TIFF file not implemented");
+
+  tstrip_t strip;
+  int bytesread;
+  ldieif(rowsperstrip>1,"GeoTIFF: more than one row per strip not implemented");
+
+  uint32_t stripsize = TIFFStripSize(tif);
+	float *sbuf = (float*) _TIFFmalloc(stripsize);
+  uint32_t rp=0;
+//  buf = _TIFFmalloc(stripsize);
+  for (uint32_t strip=0, row=0; row<ysize && row<rymax ; ++strip,row+=rowsperstrip) {
+//    if (rp+stripsize/sizeof(uint32_t) > npixels) ldie("TIFF data larger than expected: "+estr(row)+" "+estr(stripsize)+" "+estr(rp)+" "+estr(strip)+" "+estr(npixels)); 
+    bytesread=TIFFReadEncodedStrip(tif, strip, sbuf, stripsize);
+    ldieif(bytesread==-1,"Error reading GeoTIFF");
+    if (row>=rymin)
+      memcpy(&raster[(row-rymin)*rwidth],&sbuf[rxmin],rwidth*4);
+  }
+  _TIFFfree(sbuf);
+
+/*
+  uint32_t nbytes;
+  uint32_t rp=0u;
+  uint32_t scansize=TIFFScanlineSize(tif);
+  cout << "Scansize: " << scansize << endl;
+ 	for (uint32_t row=0; row<ysize; ++row){
+ 	  if (TIFFReadScanline(tif,&raster[rp],row) == -1){ lerror("reading TIFF file"); exit(-1); }
+    rp+=scansize/sizeof(float);
+// 	buf = _TIFFmalloc(TIFFScanlineSize(tif));
+  }
+*/
+ 
+  rpopsize=0;
+  int totalpopsize=0;
+  rmaxpop=(raster[0]==nodataval?0.0:raster[0]);
+  for (int i=0; i<rheight*rwidth; ++i){
+    float tmppden=(raster[i]==nodataval?0.0:raster[i]);
+    if (tmppden>rmaxpop) rmaxpop=tmppden;
+    if (shapeMask[i]!=0)
+      rpopsize+=tmppden;
+    totalpopsize+=tmppden;
+  }
+  cout << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
+
+  cout << "Adjusting raster population counts to: " << popsize << endl;
+  // adjust population counts to match current country population census
+  for (int i=0; i<rheight*rwidth; ++i){
+    float tmpf=(raster[i]==nodataval?0.0:raster[i]);
+    raster[i]=tmpf*double(rpopsize)/popsize;
+  }
+  rmaxpop=rmaxpop*double(rpopsize)/popsize;
+  cout << "rmaxpop: " << rmaxpop << endl;
 
 //  exit(0);
+
   return(0);
 }
 
@@ -786,6 +1012,13 @@ void loadShape(const estr& fname){
 //    SHPDestroyObject(psShape);
 //  }
 
+  lonRef=(psShape->dfXMax+psShape->dfXMin)/2.0;
+  for (int j=0; j<psShape->nVertices; ++j){
+    double tmpLon=proj(psShape->padfX[j],psShape->padfY[j],lonRef);
+    if (j==0 || tmpLon<lonMin) lonMin=tmpLon;
+    if (j==0 || tmpLon>lonMax) lonMax=tmpLon;
+  }
+/*
   double cx=(psShape->dfXMax-psShape->dfXMin)/2.0;
   for (int j=0; j<psShape->nVertices; ++j)
     psShape->padfX[j] = cos(M_PI*psShape->padfY[j]/180.0)*(psShape->padfX[j]-cx);
@@ -800,6 +1033,7 @@ void loadShape(const estr& fname){
     psShape->dfYMax = MAX(psShape->dfYMax,psShape->padfY[j]);
     psShape->dfYMin = MIN(psShape->dfYMin,psShape->padfY[j]);
   }
+*/
 
   SHPClose(hSHP);
 }
@@ -809,9 +1043,6 @@ int emain()
 {
   ssimstate st;
   epregister2(st.R0,"r0");
-
-  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
-  loadShape("data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp");
 
   int avgage=0; // take most age of first individual (usually the oldest), or the avg age of the household for the household age group
   epregister(avgage);
@@ -871,6 +1102,15 @@ int emain()
     popsize+=agegroups[i];
 
   cout << "# total population: " << popsize << endl;
+
+  loadShape("data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp");
+//  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
+
+  //TODO: cleanup the dependecies to make them explicit between the initializations and loading of data
+  uint8_t *frameraw = new uint8_t[1920*1080*4];
+  initCairo(frameraw,1920,1080); // loadPopDens has to be after initCairo, initCairo after loadShape because it initializes a shapemask
+
+  loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif",popsize); // loads population counts and adjusts using more recent total census data
 
   
 
@@ -1063,8 +1303,11 @@ int emain()
   cout << "# done populating households: " << assigned << endl;
 
 
-  cout << "# initializing spatial grid" << endl;
-  st.spGrid.init(st.spGridSize*st.spGridSize); // init 100 x 100 grid
+  st.spGridW=rwidth;
+  st.spGridH=rheight;
+  st.spGridSize=st.spGridW*st.spGridH;
+  cout << "# initializing spatial grid: " << st.spGridW << "x" << st.spGridH << endl;
+  st.spGrid.init(st.spGridSize); // init 100 x 100 grid
   for (int i=0; i<st.spGrid.size(); ++i){
     for (int pg=0; pg<ngroups; ++pg){
       st.spGrid[i].E=0;
@@ -1225,7 +1468,7 @@ int emain()
 
   st.allE=fseed;
   cout << "hhLevelsBegin: " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2+1] << " " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
-  st.evqueue.add(st,1010,0,2,0,counts,st.dE,rnd);  // add Exposed grid position 10,10
+//  st.evqueue.add(st,1010,0,2,0,counts,st.dE,rnd);  // add Exposed grid position 10,10
 
   cout << "# starting simulation" << endl;
 
@@ -1242,9 +1485,6 @@ int emain()
   double smr=1.0;
 
   ldieif(videoOpen()!=0,"error creating video file");
-
-  uint8_t *frameraw = new uint8_t[1920*1080*4];
-  initCairo(frameraw,1920,1080);
 
   edoublearray localIprob;
   localIprob.init(st.spGrid.size());
@@ -1308,13 +1548,13 @@ int emain()
 
     for (int gi=0; gi<st.spGrid.size(); ++gi){
       sgrid& g(st.spGrid[gi]);
-      int gx=gi%st.spGridSize;
-      int gy=gi/st.spGridSize;
+      int gx=gi%st.spGridW;
+      int gy=gi/st.spGridW;
 
-      int giup=((st.spGridSize+gy-1)%st.spGridSize)*st.spGridSize+gx;
-      int gidn=((gy+1)%st.spGridSize)*st.spGridSize+gx;
-      int gilt=gy*st.spGridSize+(st.spGridSize+gx-1)%st.spGridSize;
-      int girt=gy*st.spGridSize+(gx+1)%st.spGridSize;
+      int giup=((st.spGridH+gy-1)%st.spGridH)*st.spGridW+gx;
+      int gidn=((gy+1)%st.spGridH)*st.spGridW+gx;
+      int gilt=gy*st.spGridW+(st.spGridW+gx-1)%st.spGridW;
+      int girt=gy*st.spGridW+(gx+1)%st.spGridW;
 
       double tmpLocalIprob=localIprob[gi]*0.6 + localIprob[gilt]*0.1 + localIprob[girt]*0.1 + localIprob[giup]*0.1 + localIprob[gidn]*0.1;
 
