@@ -6,6 +6,7 @@
 #include <eutils/eparser.h>
 #include <eutils/eparserinterpreter.h>
 #include <eutils/etable.h>
+#include <eutils/vector3.h>
 
 #include <deque>
 
@@ -455,7 +456,7 @@ edoublearray delay_gamma(double mu,double shape,double tmax,double tstep)
 void colorRect(uint8_t *frameRaw,int xb,int yb,int xe,int ye,uint32_t color,int prow){
   for (int ty=yb; ty<ye; ++ty){
     for (int tx=xb; tx<xe; ++tx){
-      int p=ty*prow*3+tx*3;
+      int p=ty*prow*4+tx*4;
       frameRaw[p]=0xFF&color;
       frameRaw[p+1]=0xFF&(color>>8);
       frameRaw[p+2]=0xFF&(color>>16);
@@ -465,8 +466,113 @@ void colorRect(uint8_t *frameRaw,int xb,int yb,int xe,int ye,uint32_t color,int 
 
 inline double clamp(double vmin,double vmax,double v){ v=(v<vmin?vmin:v); return(v>vmax?vmax:v); }
 
-void renderFrame(uint8_t *frameRaw,ssimstate& st,int width,int height){
-  memset(frameRaw, 0, 1920*1080*4);
+#include <geotiff.h>
+#include <xtiffio.h>
+#include <tiffio.h>
+#include <geo_normalize.h>
+#include <geo_simpletags.h>
+#include <geovalues.h>
+
+#include <shapefil.h>
+
+#include <cairo.h>
+
+cairo_surface_t *surface=0x00;
+cairo_t *cr=0x00;
+
+
+SHPObject *psShape=0x00;
+
+static int GTIFReportACorner( GTIF *gtif, GTIFDefn *defn, FILE * fp_out, const char * corner_name, double x, double y)
+{
+//  FILE *fp_out=stdout;
+  double x_saved, y_saved;
+
+  /* Try to transform the coordinate into PCS space */
+  if ( !GTIFImageToPCS( gtif, &x, &y ) )
+    return -1;
+    
+  x_saved = x;
+  y_saved = y;
+
+  fprintf( fp_out, "%-13s ", corner_name );
+
+  if( defn->Model == ModelTypeGeographic )
+  {
+    fprintf( fp_out, "dec (%.7f,", x );
+    fprintf( fp_out, "%.7f)\n", y );
+    fprintf( fp_out, "(%s,", GTIFDecToDMS( x, "Long", 2 ) );
+    fprintf( fp_out, "%s)\n", GTIFDecToDMS( y, "Lat", 2 ) );
+  }
+  else
+  {
+    fprintf( fp_out, " dec (%12.3f,%12.3f)", x, y );
+
+    if ( GTIFProj4ToLatLong( defn, 1, &x, &y ) ) {
+      fprintf( fp_out, "  (%.7f,", x );
+      fprintf( fp_out, "%.7f)", y );
+    } 
+    else 
+    {
+      const char* pszLong = GTIFDecToDMS( x, "Long", 2 );
+      if ( pszLong[0] == 0 ){
+        fprintf( fp_out, "  (invalid)" );
+      } else {
+        fprintf( fp_out, "  (%s,", pszLong );
+        fprintf( fp_out, "%s)", GTIFDecToDMS( y, "Lat", 2 ) );
+      }
+    }
+  }
+
+  fprintf( fp_out, "\n" );
+
+//    if( inv_flag && GTIFPCSToImage( gtif, &x_saved, &y_saved ) ){
+//        fprintf( fp_out, "      inverse (%11.3f,%11.3f)\n", x_saved, y_saved );
+//    }  
+  return 0;
+}
+
+static void GTIFPrintCorners(GTIF *gtif, GTIFDefn *defn, FILE * fp_out,int xsize, int ysize)
+{
+  printf( "\nCorner Coordinates:\n" );
+
+  unsigned short raster_type = RasterPixelIsArea;
+  GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &raster_type, 0, 1);
+
+  double xmin = (raster_type == RasterPixelIsArea) ? 0.0 : -0.5;
+  double ymin = xmin;
+  double ymax = ymin + ysize;
+  double xmax = xmin + xsize;
+
+  if( GTIFReportACorner( gtif, defn, fp_out,"Upper Left", xmin, ymin) == -1 )
+  {
+      printf( " ... unable to transform points between pixel/line and PCS space\n" );
+      return;
+  }
+
+  GTIFReportACorner( gtif, defn, fp_out, "Lower Left", xmin, ymax);
+  GTIFReportACorner( gtif, defn, fp_out, "Upper Right", xmax, ymin);
+  GTIFReportACorner( gtif, defn, fp_out, "Lower Right", xmax, ymax);
+  GTIFReportACorner( gtif, defn, fp_out, "Center", xmin + xsize/2.0, ymin + ysize/2.0);
+}
+
+uint32_t v3_col(const evector3& v){ return(0xFFu&uint32_t(v.x*0xFFu) | 0xFF00u&uint32_t(v.y*0xFF00u) | 0xFF0000u&uint32_t(v.z*0xFF0000)); }
+
+uint32_t tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
+  evector3 col12=col1*(1.0-p1)+col2*p1;
+  return(v3_col((col1*(1.0-p1)+col2*p1)*(1.0-p2)+col3*p2));
+}
+
+
+void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int width,int height){
+//  memset(frameRaw, 0, 1920*1080*4);
+  for (int i=0; i<1920*1080*4; i+=4){
+    frameRaw[i]=0xff;
+    frameRaw[i+1]=0xff;
+    frameRaw[i+2]=0xff;
+    frameRaw[i+3]=0x00;
+  }
+
   double maxE=0.0;
   double maxI=0.0;
   for (int i=0; i<st.spGridSize; ++i){
@@ -483,32 +589,148 @@ void renderFrame(uint8_t *frameRaw,ssimstate& st,int width,int height){
       sgrid &g(st.spGrid[j*st.spGridSize+i]);
       double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
       double tmpE=double(g.E)/(g.N[0]+g.N[1]);
-      uint32_t color=0x010000u*uint32_t(tmpE*256.0) + 0x000100u*uint32_t(clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001)))*256.0);
+      uint32_t color=tricolor(evector3(1.0,1.0,1.0),evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
 //      uint32_t color=0xFFFFFFu;
       colorRect(frameRaw,(1920-1080)/2+i*1080/100,j*1080/100,(1920-1080)/2+(i+1)*1080/100,(j+1)*1080/100,color,width);
     }
   }
 
-  for (int i=(1920-1080)*3/2; i<width-(1920-1080)*3/2; ++i){
-    frameRaw[0*3*width + (i*3)]=0xffu;
-    frameRaw[0*3*width + (i*3)+1]=0xffu;
-    frameRaw[0*3*width + (i*3)+2]=0xffu;
-    frameRaw[1079*3*width + (i*3)]=0xffu;
-    frameRaw[1079*3*width + (i*3)+1]=0xffu;
-    frameRaw[1079*3*width + (i*3)+2]=0xffu;
+/*
+  for (int i=(1920-1080)*4/2; i<width-(1920-1080)*4/2; ++i){
+    frameRaw[0*4*width + (i*4)]=0x0u;
+    frameRaw[0*4*width + (i*4)+1]=0x0u;
+    frameRaw[0*4*width + (i*4)+2]=0x0u;
+    frameRaw[1079*4*width + (i*4)]=0x0u;
+    frameRaw[1079*4*width + (i*4)+1]=0x0u;
+    frameRaw[1079*4*width + (i*4)+2]=0x0u;
   }
   for (int j=0; j<height; ++j){
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 0)]=0xffu;
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 0)+1]=0xffu;
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 0)+2]=0xffu;
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 1079*3)]=0xffu;
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 1079*3)+1]=0xffu;
-    frameRaw[j*3*width + ((1920-1080)*3/2 + 1079*3)+2]=0xffu;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)]=0x0u;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)+1]=0x0u;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)+2]=0x0u;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)]=0x0u;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)+1]=0x0u;
+    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)+2]=0x0u;
   }
+*/
+
+  // tell cairo we have changed the image contents
+  cairo_surface_mark_dirty(surface);
+
+  double scale;
+  double xpos=0.0,ypos=0.0;
+  if ((psShape->dfXMax-psShape->dfXMin)/(psShape->dfYMax-psShape->dfYMin) > double(width)/height){
+    scale=width/(psShape->dfXMax-psShape->dfXMin);
+    ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
+  }else{
+    scale=height/(psShape->dfYMax-psShape->dfYMin);
+    xpos=(width-scale*(psShape->dfXMax-psShape->dfXMin))/2.0;
+  }
+  scale=0.9*scale;
+  ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
+  xpos=(width-scale*(psShape->dfXMax-psShape->dfXMin))/2.0;
+
+  for (int j=0, iPart=1; j<psShape->nVertices; ++j){
+    if (j == 0 && psShape->nParts > 0 )
+      cairo_move_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
+//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
+            
+    if (iPart < psShape->nParts && psShape->panPartStart[iPart]==j){
+      cairo_close_path(cr);
+      cairo_move_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
+//       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
+//      pszPartType = SHPPartTypeName( psShape->panPartType[iPart] );
+      iPart++;
+    }else
+      cairo_line_to(cr,scale*(psShape->padfX[j]-psShape->dfXMin)+xpos,1080.0-scale*(psShape->padfY[j]-psShape->dfYMin)-ypos);
+  }
+  cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+  cairo_set_line_width(cr, 1);
+  cairo_stroke (cr);
+
+
+  cairo_move_to (cr, 10.0, 50.0);
+  cairo_show_text (cr, (estr("Day: ")+day)._str);
+  cairo_move_to (cr, 10.0, 1080.0-50.0);
+  cairo_show_text (cr, estr().sprintf("Fraction exposed: %.3lf",double(st.allE)/(st.N[0]+st.N[1]))._str);
+  if (mitigation<1.0){
+    cairo_move_to (cr, 10.0, 190.0);
+    cairo_show_text (cr, estr().sprintf("Mitigation: %.2lf",mitigation)._str);
+  }
+
+/*
+  cairo_set_source_rgb (cr, 1.0, 0.0, 1.0);
+  cairo_rectangle (cr, 80.0, 60.0, 120.0, 80.0);
+  cairo_fill (cr);
+*/
+
+  // finish any cairo drawing operations
+  cairo_surface_flush(surface);
+
   videoPushFrame(frameRaw);
 }
 
-#include <shapefil.h>
+void initCairo(uint8_t *frameRaw,int width,int height)
+{
+//  cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_RGB32, width, height);
+  surface=cairo_image_surface_create_for_data(frameRaw,CAIRO_FORMAT_ARGB32,width,height,width*4);
+  int cstatus=cairo_surface_status(surface);
+  cout << "# stride RGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_RGB24,width) << endl;
+  cout << "# stride ARGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32,width) << endl;
+  ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
+  cr=cairo_create(surface); 
+
+  cairo_select_font_face (cr, "serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+  cairo_set_font_size (cr, 32.0);
+  cairo_set_source_rgb (cr, 0.0, 0.0, 1.0);
+}
+
+int loadPopDens(const estr& fname){
+  GTIF *gtif=0x00;
+  TIFF *tif=0x00;
+  tif=XTIFFOpen(fname._str,"r");
+  if (!tif) return(-1);
+	
+  gtif = GTIFNew(tif);
+  if (!gtif) {
+    fprintf(stderr,"failed in GTIFNew\n");
+    return(-1);
+  }
+
+  GTIFPrint(gtif,0,0);
+
+  int xsize, ysize;
+  TIFFGetField( tif, TIFFTAG_IMAGEWIDTH, &xsize );
+  TIFFGetField( tif, TIFFTAG_IMAGELENGTH, &ysize );
+  int spp=0,sf=0,depth=0,bps=0;
+  TIFFGetField( tif, TIFFTAG_BITSPERSAMPLE, &bps );
+  TIFFGetField( tif, TIFFTAG_IMAGEDEPTH, &depth );
+  TIFFGetField( tif, TIFFTAG_SAMPLESPERPIXEL, &spp );
+  TIFFGetField( tif, TIFFTAG_SAMPLEFORMAT, &sf );
+  cout << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << endl;
+
+  GTIFDefn defn;
+  if (GTIFGetDefn(gtif, &defn)){
+    printf( "\n" );
+    GTIFPrintDefnEx( gtif, &defn, stdout );
+
+    printf( "\n" );
+    printf( "PROJ.4 Definition: %s\n", GTIFGetProj4Defn(&defn));
+            
+    GTIFPrintCorners( gtif, &defn, stdout, xsize, ysize);
+  }
+
+	int npixels = xsize * ysize;
+	uint32_t *raster = (uint32*) _TIFFmalloc(npixels * sizeof (uint32));
+	if (raster == NULL) return(-1);
+
+	if (!TIFFReadRGBAImage(tif, xsize, ysize, raster, 0)) return(-1);
+
+//  _TIFFfree(raster);
+
+//  exit(0);
+  return(0);
+}
 
 
 void loadShape(const estr& fname){
@@ -534,23 +756,25 @@ void loadShape(const estr& fname){
             nPrecision, adfMaxBound[2], 
             nPrecision, adfMaxBound[3] ); 
 
-  for (int i=0; i<nEntities; ++i){
-    int j;
-    SHPObject *psShape;
+  ldieif(nEntities>1,"more than one shape entity found");
 
-    psShape = SHPReadObject(hSHP, i);
+//  for (int i=0; i<nEntities; ++i){
+    int j;
+//    SHPObject *psShape;
+
+    psShape = SHPReadObject(hSHP, 0);
 
     if (psShape == NULL) {
       fprintf( stderr,
                    "Unable to read shape %d, terminating object reading.\n",
-                    i );
-      break;
-    }
+                    0 );
+//      break;
+    }else{
 
-    printf( "\nShape:%d (%s)  nVertices=%d, nParts=%d\n"
+      printf( "\nShape:%d (%s)  nVertices=%d, nParts=%d\n"
                   "  Bounds:(%.*g,%.*g, %.*g)\n"
                   "      to (%.*g,%.*g, %.*g)\n",
-                    i, SHPTypeName(psShape->nSHPType),
+                    0, SHPTypeName(psShape->nSHPType),
                     psShape->nVertices, psShape->nParts,
                     nPrecision, psShape->dfXMin,
                     nPrecision, psShape->dfYMin,
@@ -558,9 +782,25 @@ void loadShape(const estr& fname){
                     nPrecision, psShape->dfXMax,
                     nPrecision, psShape->dfYMax,
                     nPrecision, psShape->dfZMax ); 
+    }
+//    SHPDestroyObject(psShape);
+//  }
 
-    SHPDestroyObject(psShape);
+  double cx=(psShape->dfXMax-psShape->dfXMin)/2.0;
+  for (int j=0; j<psShape->nVertices; ++j)
+    psShape->padfX[j] = cos(M_PI*psShape->padfY[j]/180.0)*(psShape->padfX[j]-cx);
+
+  psShape->dfXMax=psShape->padfX[0];
+  psShape->dfXMin=psShape->padfX[0];
+  psShape->dfYMax=psShape->padfY[0];
+  psShape->dfYMin=psShape->padfY[0];
+  for (int j=1; j<psShape->nVertices; ++j){
+    psShape->dfXMax = MAX(psShape->dfXMax,psShape->padfX[j]);
+    psShape->dfXMin = MIN(psShape->dfXMin,psShape->padfX[j]);
+    psShape->dfYMax = MAX(psShape->dfYMax,psShape->padfY[j]);
+    psShape->dfYMin = MIN(psShape->dfYMin,psShape->padfY[j]);
   }
+
   SHPClose(hSHP);
 }
 
@@ -570,12 +810,8 @@ int emain()
   ssimstate st;
   epregister2(st.R0,"r0");
 
-
+  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
   loadShape("data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp");
-  exit(0);
-
-  
-
 
   int avgage=0; // take most age of first individual (usually the oldest), or the avg age of the household for the household age group
   epregister(avgage);
@@ -1008,13 +1244,14 @@ int emain()
   ldieif(videoOpen()!=0,"error creating video file");
 
   uint8_t *frameraw = new uint8_t[1920*1080*4];
+  initCairo(frameraw,1920,1080);
 
   edoublearray localIprob;
   localIprob.init(st.spGrid.size());
 
   cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
   for (int it=0; it*st.tstep<tmax; ++it){
-    renderFrame(frameraw,st,1920,1080);
+    renderFrame(it*st.tstep,smr,frameraw,st,1920,1080);
 
     if (tmstart>=0 && it*st.tstep >= tmstart){
       smr=fmr;
