@@ -18,7 +18,7 @@ int frameCounter = 0;
 AVFormatContext *ofctx = nullptr;
 AVOutputFormat *oformat = nullptr;
 
-int fps = 15;
+int fps = 5;
 int width = 1920;
 int height = 1080;
 int bitrate = 2000;
@@ -36,9 +36,9 @@ void videoPushFrame(uint8_t *data){
     }
   }
   if (!swsCtx)
-    swsCtx = sws_getContext(cctx->width, cctx->height, AV_PIX_FMT_RGB24, cctx->width, cctx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, 0, 0, 0);
+    swsCtx = sws_getContext(cctx->width, cctx->height, AV_PIX_FMT_RGBA, cctx->width, cctx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, 0, 0, 0);
 
-  int inLinesize[1] = { 3 * cctx->width };
+  int inLinesize[1] = { 4 * cctx->width };
 
   // From RGB to YUV
   sws_scale(swsCtx, (const uint8_t * const *)&data, inLinesize, 0, cctx->height, videoFrame->data, videoFrame->linesize);
