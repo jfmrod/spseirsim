@@ -32,6 +32,28 @@ int binomial(int n,double p,const ernd& r)
   return gsl_ran_binomial(r.grng, p, n);
 }
 
+template<class T>
+void permute(T& arr,int s,int l,ernd& r){
+  for (int i=0; i<l-1; ++i){
+    int ir=r.uniformint(l);
+    if (ir==i) continue;
+    swap(arr[s+i],arr[s+ir]);
+  }
+}
+
+/*
+template<class T>
+void permute_toend(T& arr,int s,ernd& r){
+  for (int i=0; i<s; ++i){
+    int ir=r.uniformint(arr.size());
+    swap(arr[ir],arr[arr.size()-1-i]);
+  }
+}
+*/
+
+
+/*
+
 void permute(ebasicarray<uint8_t>& pop_ages,int ind,int size,ernd& r){
   for (int i=0; i<size-1; ++i){
     int ir=r.uniformint(size);
@@ -39,6 +61,7 @@ void permute(ebasicarray<uint8_t>& pop_ages,int ind,int size,ernd& r){
     swap(pop_ages[ind+i],pop_ages[ind+ir]);
   }
 }
+*/
 
 edoublearray delay_gamma(double mu,double shape,double tmax,double tstep);
 
@@ -439,6 +462,21 @@ deque<sevent>& evqueuelist::step()
   return(tmpevarr);
 }
 
+int samplehh(eintarray& arr,ebasicarray<shousehold>& hhs,int s,ernd& r){
+  int scount;
+  int i;
+  do{
+    scount=0;
+    for (i=0; i<arr.size() && scount < s; ++i){
+      int ir=r.uniformint(arr.size()-i);
+      scount+=hhs[arr[ir]].size;
+      if (ir!=arr.size()-1-i)
+        swap(arr[ir],arr[arr.size()-1-i]);
+    }
+  } while (scount!=s);
+  return(i);
+}
+
 
 edoublearray delay_gamma(double mu,double shape,double tmax,double tstep)
 {
@@ -539,30 +577,32 @@ static int GTIFReportACorner( GTIF *gtif, GTIFDefn *defn, FILE * fp_out, const c
 
 GTIF *gtif=0x00;
 float nodataval=0.0;
-float *raster=0x00;
+int rmaxpop=0.0;
+int rpopsize=0;
 int rwidth=0;
 int rheight=0;
-float rmaxpop=0.0;
-int rpopsize=0;
+int imaxpop=-1;
 
-/*
-inline float readPopDens(double lon,double lat){
-  GTIFPCSToImage( gtif, &lon,&lat );
-  return(raster[uint32_t(lat)*rwidth + uint32_t(lon)]==nodataval?0.0:raster[uint32_t(lat)*rwidth + uint32_t(lon)]);
+eintarray popCounts;
+
+inline int readPopDensR(uint32_t ix,uint32_t iy){
+//  return(raster[iy*rwidth + ix]==nodataval?0.0:raster[iy*rwidth + ix]); // nodata values are already zeroed
+  return(popCounts[iy*rwidth + ix]); 
 }
-*/
-
-inline float readPopDensR(uint32_t ix,uint32_t iy){
-  return(raster[iy*rwidth + ix]==nodataval?0.0:raster[iy*rwidth + ix]);
-}
-
 
 
 uint32_t v3_col(const evector3& v){ return(0xFFu&uint32_t(v.x*0xFFu) | 0xFF00u&uint32_t(v.y*0xFF00u) | 0xFF0000u&uint32_t(v.z*0xFF0000)); }
 
+/*
 uint32_t tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
   evector3 col12=col1*(1.0-p1)+col2*p1;
   return(v3_col((col1*(1.0-p1)+col2*p1)*(1.0-p2)+col3*p2));
+}
+*/
+
+evector3 tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
+  evector3 col12=col1*(1.0-p1)+col2*p1;
+  return((col1*(1.0-p1)+col2*p1)*(1.0-p2)+col3*p2);
 }
 
 
@@ -581,20 +621,28 @@ double revproj(double lon,double lat,double reflon){
   return(lon/cos(M_PI*lat/180.0)+reflon + lonMin);
 }
 
-void cairoDrawShape(cairo_t *cr,SHPObject *shp){
+void cairoDrawShape(cairo_t *cr,SHPObject *shp,float x,float y,float s,bool projection,float height,bool inverted){
   for (int j=0, iPart=1; j<shp->nVertices; ++j){
+    
+    float sx=s*(shp->padfX[j]-shp->dfXMin)+x;
+    if (projection)
+      sx=s*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+x;
+    
+    float sy=s*(shp->padfY[j]-shp->dfYMin)+y;
+    if (inverted)
+      sy=height-sy;
     if (j == 0 && shp->nParts > 0 )
-      cairo_move_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+      cairo_move_to(cr,sx,sy);
 //       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
             
     if (iPart < shp->nParts && shp->panPartStart[iPart]==j){
       cairo_close_path(cr);
-      cairo_move_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+      cairo_move_to(cr,sx,sy);
 //       pszPartType = SHPPartTypeName( psShape->panPartType[0] );
 //      pszPartType = SHPPartTypeName( psShape->panPartType[iPart] );
       iPart++;
     }else
-      cairo_line_to(cr,scale*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+xpos,1080.0-scale*(shp->padfY[j]-shp->dfYMin)-ypos);
+      cairo_line_to(cr,sx,sy);
   }
 }
 
@@ -631,58 +679,46 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
 
   for (int i=0; i<st.spGridW; ++i){
     for (int j=0; j<st.spGridH; ++j){
-      double sxlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
-      double sylat=j*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+//      double sxlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+//      double sylat=j*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
 
-      double xlon=(i-0.5)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
-      double ylat=(j-0.5)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+      double xlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylat=(st.spGridH-j-1)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
 
-      double xlonn=(i+1-0.5)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
-      double ylatn=(j+1-0.5)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+      double xlonn=(i+1)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylatn=(st.spGridH-j)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
 
       double sx=scale*(proj(xlon,ylat,lonRef)-lonMin)+xpos;
-      double sy=1080.0-scale*(ylat-psShape->dfYMin)-ypos;
-//      cout << "i: " << i << " j: " << j << " xlonylat: " << xlon << " " << ylat << " sxsy: " << sx << " " << sy <<endl;
+      double sy=height-scale*(ylat-psShape->dfYMin)-ypos;
 
-      double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos;
-      double syn=1080.0-scale*(ylatn-psShape->dfYMin)-ypos;
+      double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos+1.0; // 1.0 is added to avoid tears
+      double syn=height-scale*(ylatn-psShape->dfYMin)-ypos-1.0;
 
       sgrid &g(st.spGrid[j*st.spGridW+i]);
       double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
-      double tmpE=double(g.E)/(g.N[0]+g.N[1]);
-      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,rheight-j)+0.001)-log(0.001))/(log(rmaxpop+0.001)-log(0.001))*0.6+0.4);
+//      double tmpE=double(g.E)/(g.N[0]+g.N[1]);
+      double tmpE=(g.N[0]+g.N[1]==0?0.0:double(g.E)/(g.N[0]+g.N[1]));
+      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.001)-log(0.001))/(log(rmaxpop+0.001)-log(0.001))*0.6+0.4);
 //      float pdens=clamp(0.0,1.0,readPopDensR(i+rxmin,rymax-j)/maxpdens*0.6+0.4);
 //      float pdens=clamp(0.0,1.0,readPopDens(i*(psShape->dfXMax-psShape->dfXMin)/100.0+psShape->dfXMin,j*(psShape->dfYMax-psShape->dfYMin)/100.0+psShape->dfYMin)/maxpdens);
-      uint32_t color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
-//      uint32_t color=0xFFFFFFu;
-      colorRect(frameRaw,sx,sy,sxn,syn,color,width);
+//      uint32_t color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+//      colorRect(frameRaw,sx,sy,sxn,syn,color,width);
+      evector3 color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+      cairo_move_to(cr,sx,sy);
+      cairo_line_to(cr,sxn,sy);
+      cairo_line_to(cr,sxn,syn);
+      cairo_line_to(cr,sx,syn);
+      cairo_close_path(cr);
+      cairo_set_source_rgb(cr, color.x, color.y, color.z);
+      cairo_fill(cr);
     }
   }
 
 
-/*
-  for (int i=(1920-1080)*4/2; i<width-(1920-1080)*4/2; ++i){
-    frameRaw[0*4*width + (i*4)]=0x0u;
-    frameRaw[0*4*width + (i*4)+1]=0x0u;
-    frameRaw[0*4*width + (i*4)+2]=0x0u;
-    frameRaw[1079*4*width + (i*4)]=0x0u;
-    frameRaw[1079*4*width + (i*4)+1]=0x0u;
-    frameRaw[1079*4*width + (i*4)+2]=0x0u;
-  }
-  for (int j=0; j<height; ++j){
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)]=0x0u;
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)+1]=0x0u;
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 0)+2]=0x0u;
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)]=0x0u;
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)+1]=0x0u;
-    frameRaw[j*4*width + ((1920-1080)*4/2 + 1079*4)+2]=0x0u;
-  }
-*/
-
   // tell cairo we have changed the image contents
-  cairo_surface_mark_dirty(surface);
+//  cairo_surface_mark_dirty(surface);
 
-  cairoDrawShape(cr,psShape);
+  cairoDrawShape(cr,psShape,xpos,ypos,scale,true,height,true);
   cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_set_line_width(cr, 1);
   cairo_stroke (cr);
@@ -708,8 +744,6 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
   videoPushFrame(frameRaw);
 }
 
-uint8_t *shapeMask=0x00;
-
 void initCairo(uint8_t *frameRaw,int width,int height)
 {
 //  cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_RGB32, width, height);
@@ -723,23 +757,6 @@ void initCairo(uint8_t *frameRaw,int width,int height)
   cairo_select_font_face (cr, "serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
   cairo_set_font_size (cr, 32.0);
   cairo_set_source_rgb (cr, 0.0, 0.0, 1.0);
-
-  cairo_surface_t *surfacemask=0x00;
-  cairo_t *crmask=0x00;
-
-
-  shapeMask=new uint8_t[rwidth*rheight];
-  memset(shapeMask,0,rwidth*rheight);
-  surfacemask=cairo_image_surface_create_for_data(shapeMask,CAIRO_FORMAT_A8,rwidth,rheight,rwidth);
-  cstatus=cairo_surface_status(surfacemask);
-  ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
-  crmask=cairo_create(surfacemask); 
-  cairoDrawShape(crmask,psShape);
-  cairo_set_source_rgb(crmask,1.0,1.0,1.0);
-  cairo_fill(crmask);
-  cairo_surface_flush(surfacemask);
-  cairo_destroy(crmask);
-  cairo_surface_destroy(surfacemask);
 }
 
 #include <byteswap.h>
@@ -785,7 +802,7 @@ static void _XTIFFInitialize(void)
 
 
 
-int loadPopDens(const estr& fname,int popsize){
+int loadPopDens(const estr& fname){
   _XTIFFInitialize(); // needed to setup GDAL novalue TAG info for TIFF, should just use the GDAL library for this
 
   TIFF *tif=0x00;
@@ -818,7 +835,6 @@ int loadPopDens(const estr& fname,int popsize){
   TIFFGetField( tif, TIFFTAG_GDAL_NODATA, &tnodataval);
   nodataval=estr(tnodataval).f();
   
-
   cout << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << " rowsperstrip: " << rowsperstrip << endl;
 
   GTIFDefn defn;
@@ -895,9 +911,8 @@ int loadPopDens(const estr& fname,int popsize){
   cout << "rwidth: " << rwidth << " rheight: " << rheight <<endl;
  
 	int npixels = rwidth * rheight;
-	raster = (float*) _TIFFmalloc(npixels * sizeof (float));
+	float *raster = (float*) _TIFFmalloc(npixels * sizeof (float));
 	if (raster == NULL) return(-1);
-
 
   uint32_t config=0u;
   TIFFGetField(tif, TIFFTAG_PLANARCONFIG, &config);
@@ -911,12 +926,12 @@ int loadPopDens(const estr& fname,int popsize){
 	float *sbuf = (float*) _TIFFmalloc(stripsize);
   uint32_t rp=0;
 //  buf = _TIFFmalloc(stripsize);
-  for (uint32_t strip=0, row=0; row<ysize && row<rymax ; ++strip,row+=rowsperstrip) {
+  for (uint32_t strip=rymin, row=rymin; row<ysize && row<rymax ; ++strip,row+=rowsperstrip) {
 //    if (rp+stripsize/sizeof(uint32_t) > npixels) ldie("TIFF data larger than expected: "+estr(row)+" "+estr(stripsize)+" "+estr(rp)+" "+estr(strip)+" "+estr(npixels)); 
     bytesread=TIFFReadEncodedStrip(tif, strip, sbuf, stripsize);
     ldieif(bytesread==-1,"Error reading GeoTIFF");
-    if (row>=rymin)
-      memcpy(&raster[(row-rymin)*rwidth],&sbuf[rxmin],rwidth*4);
+//    if (row>=rymin)
+    memcpy(&raster[(row-rymin)*rwidth],&sbuf[rxmin],rwidth*4);
   }
   _TIFFfree(sbuf);
 
@@ -932,30 +947,89 @@ int loadPopDens(const estr& fname,int popsize){
   }
 */
  
-  rpopsize=0;
-  int totalpopsize=0;
-  rmaxpop=(raster[0]==nodataval?0.0:raster[0]);
+  popCounts.init(rheight*rwidth);
   for (int i=0; i<rheight*rwidth; ++i){
-    float tmppden=(raster[i]==nodataval?0.0:raster[i]);
-    if (tmppden>rmaxpop) rmaxpop=tmppden;
-    if (shapeMask[i]!=0)
-      rpopsize+=tmppden;
-    totalpopsize+=tmppden;
+    if (raster[i]==nodataval) raster[i]=0.0;
+    popCounts[i]=raster[i];
+    ldieif(popCounts[i]<0,"negative population counts on grid?");
   }
-  cout << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
-
-  cout << "Adjusting raster population counts to: " << popsize << endl;
-  // adjust population counts to match current country population census
-  for (int i=0; i<rheight*rwidth; ++i){
-    float tmpf=(raster[i]==nodataval?0.0:raster[i]);
-    raster[i]=tmpf*double(rpopsize)/popsize;
-  }
-  rmaxpop=rmaxpop*double(rpopsize)/popsize;
-  cout << "rmaxpop: " << rmaxpop << endl;
-
-//  exit(0);
 
   return(0);
+}
+
+void adjustPopCounts(int popsize)
+{
+  cairo_surface_t *surfacemask=0x00;
+  cairo_t *crmask=0x00;
+
+  uint8_t *shapeMask=0x00;
+
+  ldieif(popCounts.size()==0,"popCounts not initialized yet?");
+
+  int shapeRow=cairo_format_stride_for_width(CAIRO_FORMAT_A8,rwidth);
+  shapeMask=new uint8_t[rheight*shapeRow];
+  memset(shapeMask,0,rheight*shapeRow);
+
+  surfacemask=cairo_image_surface_create_for_data(shapeMask,CAIRO_FORMAT_A8,rwidth,rheight,shapeRow);
+  int cstatus=cairo_surface_status(surfacemask);
+  cout << "# stride A8 width: " << rwidth << " stride: " << cairo_format_stride_for_width (CAIRO_FORMAT_A8,rwidth) << endl;
+  ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
+  crmask=cairo_create(surfacemask); 
+  cairoDrawShape(crmask,psShape,0.0,0.0,float(rwidth)/(psShape->dfXMax-psShape->dfXMin),false,rheight,true);
+
+  cairo_set_source_rgb(crmask,1.0,1.0,1.0);
+  cairo_fill(crmask);
+  cairo_surface_flush(surfacemask);
+  cairo_destroy(crmask);
+  cairo_surface_destroy(surfacemask);
+
+  rpopsize=0;
+  rmaxpop=0;
+  imaxpop=0;
+  int totalpopsize=0;
+  for (int ix=0; ix<rwidth; ++ix){
+    for (int iy=0; iy<rheight; ++iy){
+      int i=iy*rwidth+ix;
+      totalpopsize+=popCounts[i];
+      if (shapeMask[iy*shapeRow+ix]==0) { popCounts[i]=0; continue; }
+      if (popCounts[i]>rmaxpop) { imaxpop=i;  rmaxpop=popCounts[i]; }
+      rpopsize+=popCounts[i];
+    }
+  }
+  cout << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
+  cout << "rmaxpop: " << popCounts[imaxpop] << endl;
+
+
+  
+
+  cout << "Adjusting raster population counts to: " << popsize << endl;
+  while (fabs(rpopsize-popsize)>0.01*popCounts[imaxpop]){
+    // adjust population counts to match current country population census
+    long numfrac=0;
+    for (int i=0; i<popCounts.size(); ++i){
+      long tmpf=popCounts[i];
+      tmpf=(tmpf*popsize+numfrac)/rpopsize;
+      numfrac=(long(popCounts[i])*popsize+numfrac)%rpopsize;
+      popCounts[i]=tmpf;
+//    frac=(tmpf*double(popsize)/rpopsize+frac-floor(tmpf*double(popsize)/rpopsize+frac));
+    }
+//  rmaxpop=rmaxpop*double(popsize)/rpopsize;
+    cout << "rpopsize: " << rpopsize << " " << double(rpopsize)/popsize << endl;
+
+    rpopsize=0;
+    for (int i=0; i<popCounts.size(); ++i)
+      rpopsize+=popCounts[i];
+  }
+  cout << "rpopsize after initial adjustment: " << rpopsize << endl;
+  cout << "rmaxpop after initial adjustment: " << popCounts[imaxpop] << endl;
+  cout << "Final adjustment to grid with highest count:" << endl;
+  popCounts[imaxpop]+=popsize-rpopsize;
+  rmaxpop=popCounts[imaxpop];
+  cout << "adjusted rmaxpop: " << rmaxpop << endl;
+
+
+  delete[] shapeMask;
+//  exit(0);
 }
 
 
@@ -1106,11 +1180,13 @@ int emain()
   loadShape("data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp");
 //  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
 
+  loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif"); // loads population counts raster data
+
   //TODO: cleanup the dependecies to make them explicit between the initializations and loading of data
   uint8_t *frameraw = new uint8_t[1920*1080*4];
-  initCairo(frameraw,1920,1080); // loadPopDens has to be after initCairo, initCairo after loadShape because it initializes a shapemask
+  initCairo(frameraw,1920,1080); // initCairo after loadShape because it initializes a shapemask and after loading population raster data, to have a grid defined already
 
-  loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif",popsize); // loads population counts and adjusts using more recent total census data
+  adjustPopCounts(popsize);
 
   
 
@@ -1329,13 +1405,100 @@ int emain()
     st.N[hh.group]+=hh.size;
   }
 
+  eintarray hhids;
+  hhids.init(st.households.size());
+  for (int i=0; i<hhids.size(); ++i)
+    hhids[i]=i;
+//  permute(hhids,0,hhids.size(),rnd);
+
+
+  int gassign=0;
+  int gpopAll=0;
+  for (int i=0; i<st.spGrid.size(); ++i){
+    sgrid &g(st.spGrid[i]);
+    int gpop=popCounts[i];
+    if (popsize-gpopAll<500) { cout << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << endl; }
+    if (gpop > popsize-gpopAll) { cout << "more individuals needed than available: " << gpop << " " << popsize-gpopAll <<endl; exit(-1); break; }
+    int hhcount=samplehh(hhids,st.households,gpop,rnd); // find a random set of hh that sum to popsize in the grid and put it at the end of hhids
+    for (int l=0; l<hhcount; ++l){
+      shousehold &hh(st.households[hhids[hhids.size()-1]]);
+      hh.gridpos=i;
+      g.N[hh.group]+=hh.size;
+      gpopAll+=hh.size;
+      gpop-=hh.size;
+      ++gassign;
+      hhids.erase(hhids.size()-1);
+    }
+    ldieif(gpop!=0,"gpop not zero? gpop: "+estr(gpop)+" i: "+estr(i));
+  }
+  ldieif(popsize-gpopAll!=0 || hhids.size()>0,"seeding households on grid failed, population size: " + estr(popsize) + " individuals in households on grid: " +estr(gpopAll)+" households left: "+hhids.size());
+
+/*
+//  gpopAllCounts
+  eintarray gposleft;
+
+  int gassign=0;
+  int gpopAll=0;
+  hi=0;
+  for (int i=0; i<rwidth*rheight; ++i){
+    int gpop=raster[i];
+    for (;hi<hhids.size() && st.households[hhids[hi]].size <= gpop; ++hi){
+      shousehold &hh(st.households[hhids[hi]]);
+      gpop-=hh.size;
+      hh.gridpos=i;
+      gpopAll+=hh.size;
+      ++gassign;
+      st.spGrid[hh.gridpos].N[hh.group]+=hh.size;
+    }
+    if (gpop>0)
+      gposleft.add(i);
+  }
+  for ( ;hi<hhids.size(); ++hi){
+    int ri;
+    shousehold &hh(st.households[hhids[hi]]);
+    cout << total_households-hi << " " << popsize-gpopAll << " " << hh.size << endl;
+    do{
+      ri=rnd.uniformint(gposleft.size());
+    }while (hh.size>raster[gposleft[ri]]-st.spGrid[gposleft[ri]].N[0]-st.spGrid[gposleft[ri]].N[1]);
+    sgrid &g(st.spGrid[gposleft[ri]]);
+    hh.gridpos=gposleft[ri];
+    gpopAll+=hh.size;
+    ++gassign;
+    g.N[hh.group]+=hh.size;
+    if (raster[gposleft[ri]]-g.N[0]-g.N[1]==0){
+      if (ri!=gposleft.size()-1)
+        swap(gposleft[ri],gposleft[gposleft.size()-1]);
+      gposleft.erase(gposleft.size()-1);
+    }
+  }
+  cout << "gassign: " << gassign << endl;
+  cout << "gridposleft: " << gposleft.size() << endl;
+  cout << "gpopleft: " << popsize-gpopAll << endl;
+*/
+
+/*
+  int gpopAllCounts=0;
+  eintarray gpopCounts;
+  gpopCounts.init(rwidth*rheight,0);
+  for (int i=0; i<gpopCounts.size(); ++i){
+    gpopCounts[i]=raster[i];
+    gpopAllCounts+=raster[i];
+  }
+
   // randomly place households across grid
   for (int i=0; i<st.households.size(); ++i){
-    shousehold &hh(st.households[i]);
+    shousehold &hh(st.households[hhids[i]]);
 
-    hh.gridpos=rnd.uniformint(st.spGrid.size());
+    do{
+      hh.gridpos=rnd.uniformint(st.spGrid.size());
+    }while (gpopCounts[hh.gridpos]<hh.size);
+    gpopCounts[hh.gridpops]-=hh.size;
     st.spGrid[hh.gridpos].N[hh.group]+=hh.size;
+    gpopAllCounts-=hh.size;
+    if (gpopAllCounts<100)
+      cout << gpopAllCounts << endl;
   }
+*/
 
   cout << "# initializing levels" << endl;
 
@@ -1465,10 +1628,9 @@ int emain()
 
 //  st.allIp=fseed; // directly as presymptomatic
 //  st.evqueue.add(st,6,2,0,counts,st.dIp,rnd,2); 
-
-  st.allE=fseed;
-  cout << "hhLevelsBegin: " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2+1] << " " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
-//  st.evqueue.add(st,1010,0,2,0,counts,st.dE,rnd);  // add Exposed grid position 10,10
+//  st.allE=fseed;
+//  cout << "hhLevelsBegin: " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2+1] << " " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
+  st.evqueue.add(st,imaxpop,0,2,0,counts,st.dE,rnd);  // add Exposed to grid position with highest population count
 
   cout << "# starting simulation" << endl;
 
@@ -1542,12 +1704,15 @@ int emain()
     fE=double(st.allE)/popsize;
     for (int gi=0; gi<st.spGrid.size(); ++gi){
       sgrid& g(st.spGrid[gi]);
+      if (g.N[0]+g.N[1]==0) { localIprob[gi]=0.0; continue; }
       // TODO: precompute all infection probabilities before updating data!
       localIprob[gi]=finter*R0day*(0.5*g.Ia[0]+g.Ip[0]+g.Is[0] + (MIN(smr,soldr)/smr)*(0.5*g.Ia[1]+g.Ip[1]+g.Is[1]) )/(g.N[0]+(MIN(smr,soldr)/smr)*g.N[1]);
     }
 
     for (int gi=0; gi<st.spGrid.size(); ++gi){
       sgrid& g(st.spGrid[gi]);
+      if (g.N[0]+g.N[1]==0) { continue; } // skip empty grid
+
       int gx=gi%st.spGridW;
       int gy=gi/st.spGridW;
 
@@ -1556,9 +1721,9 @@ int emain()
       int gilt=gy*st.spGridW+(st.spGridW+gx-1)%st.spGridW;
       int girt=gy*st.spGridW+(gx+1)%st.spGridW;
 
+      // TODO: handle adjacent empty grids or big differences in population sizes. How should they affect the probability of infection of an adjacent grid?
       double tmpLocalIprob=localIprob[gi]*0.6 + localIprob[gilt]*0.1 + localIprob[girt]*0.1 + localIprob[giup]*0.1 + localIprob[gidn]*0.1;
 
-      // TODO: precompute all infection probabilities before updating data!
       for (int hg=0; hg<ngroups; ++hg){
         for (int hhsize=1; hhsize<householdSizeDist.size(); ++hhsize){ // TODO: should move levels to outter loop for efficiency, inner loop should be longest sequential array of data
           for (int hhexp=hhsize-1; hhexp>=0; --hhexp){ // NOTE: have to do decreasing here to avoid infecting twice the same house in the same step
