@@ -1159,6 +1159,91 @@ void adjustPopCounts(int popsize)
 //  exit(0);
 }
 
+void loadDBF(const estr& fname)
+{
+  DBFHandle hDBF = DBFOpen( pszFilename, "rb" );
+  if (hDBF == NULL ){
+    printf( "DBFOpen(%s,\"r\") failed.\n", argv[1] );
+    exit( 2 );
+  }
+    
+  if ( DBFGetFieldCount(hDBF) == 0 ){
+    printf( "There are no fields in this table!\n" );
+    exit( 3 );
+  }
+
+  for (int i = 0; i < DBFGetFieldCount(hDBF); ++i){
+    DBFFieldType	eType;
+    const char	 	*pszTypeName;
+    char chNativeType;
+
+    chNativeType = DBFGetNativeFieldType( hDBF, i );
+
+    eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
+    if( eType == FTString )
+        pszTypeName = "String";
+    else if( eType == FTInteger )
+        pszTypeName = "Integer";
+    else if( eType == FTDouble )
+        pszTypeName = "Double";
+    else if( eType == FTInvalid )
+        pszTypeName = "Invalid";
+
+    printf( "Field %d: Type=%c/%s, Title=`%s', Width=%d, Decimals=%d\n",
+            i, chNativeType, pszTypeName, szTitle, nWidth, nDecimals );
+  }
+
+  for( i = 0; i < DBFGetFieldCount(hDBF) && !bMultiLine; i++ ){
+    DBFFieldType	eType;
+
+    eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
+  }
+  printf( "\n" );
+
+  for ( iRecord = 0; iRecord < DBFGetRecordCount(hDBF); iRecord++ ) {
+    for ( i = 0; i < DBFGetFieldCount(hDBF); i++ ){
+      DBFFieldType eType;
+            
+      eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
+
+      if( DBFIsAttributeNULL( hDBF, iRecord, i ) ) {
+        if( eType == FTString )
+          sprintf( szFormat, "%%-%ds", nWidth );
+        else
+          sprintf( szFormat, "%%%ds", nWidth );
+
+        printf( szFormat, "(NULL)" );
+      } else {
+        switch( eType ){
+          case FTString:
+            sprintf( szFormat, "%%-%ds", nWidth );
+            printf( szFormat, 
+                    DBFReadStringAttribute( hDBF, iRecord, i ) );
+            break;
+            
+          case FTInteger:
+            sprintf( szFormat, "%%%dd", nWidth );
+            printf( szFormat, 
+                    DBFReadIntegerAttribute( hDBF, iRecord, i ) );
+            break;
+            
+          case FTDouble:
+            sprintf( szFormat, "%%%d.%dlf", nWidth, nDecimals );
+            printf( szFormat, 
+                    DBFReadDoubleAttribute( hDBF, iRecord, i ) );
+            break;
+            
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+
+  DBFClose( hDBF );
+}
+
 
 void loadShape(const estr& fname,double lonLimit=-1000.0){
   SHPHandle hSHP;
