@@ -19,9 +19,9 @@ AVFormatContext *ofctx = nullptr;
 AVOutputFormat *oformat = nullptr;
 
 int fps = 5;
-int width = 1920;
-int height = 1080;
-int bitrate = 2000;
+//int width = 1920;
+//int height = 1080;
+//int bitrate = 2000;
 
 void videoPushFrame(uint8_t *data){
   int err;
@@ -42,7 +42,7 @@ void videoPushFrame(uint8_t *data){
 
   // From RGB to YUV
   sws_scale(swsCtx, (const uint8_t * const *)&data, inLinesize, 0, cctx->height, videoFrame->data, videoFrame->linesize);
-  videoFrame->pts = (1.0/30.0)*90000*(frameCounter++);
+  videoFrame->pts = (1.0/fps)*90000.0*(frameCounter++);
 //  std::cout << videoFrame->pts <<" " << cctx->time_base.num << " " << cctx->time_base.den << " " << frameCounter<< std::endl;
   if ((err = avcodec_send_frame(cctx, videoFrame)) < 0) {
     std::cout << "Failed to send frame" << err <<std::endl;
@@ -112,8 +112,9 @@ static void free(){
   }
 }
 
-int videoOpen()
+int videoOpen(int width,int height,int _fps,int bitrate)
 {
+  fps=_fps;
   av_register_all();
   avcodec_register_all();
 
@@ -155,10 +156,15 @@ int videoOpen()
   stream->codecpar->format = AV_PIX_FMT_YUV420P;
   stream->codecpar->bit_rate = bitrate * 1000;
   avcodec_parameters_to_context(cctx, stream->codecpar);
-  cctx->time_base = (AVRational){ 1, 1 };
-//  cctx->time_base = (AVRational){ 1, 30 };
-  cctx->max_b_frames = 2;
+//  cctx->time_base = (AVRational){ 1, 1 };
+//  cctx->time_base = (AVRational){ 1, fps };
+
+  cctx->pix_fmt = AV_PIX_FMT_YUV420P;
+  cctx->time_base = (AVRational){ 1000, 1 };
+  cctx->max_b_frames = 0;
+//  cctx->max_b_frames = 2;
   cctx->gop_size = 12;
+//  cctx->gop_size = fps;
   cctx->framerate= (AVRational){fps, 1};
 
 //  cctx->codec_tag = MKTAG('h', 'v', 'c', '1');
@@ -184,11 +190,18 @@ int videoOpen()
 //must remove the following
 //  cctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-  av_opt_set(cctx->priv_data, "profile", "baseline", 0);
+//  cctx->level=30;
+  cctx->level=32;
+  av_opt_set(cctx->priv_data, "profile", "baseline", AV_OPT_SEARCH_CHILDREN);
+
+/*
   if (stream->codecpar->codec_id == AV_CODEC_ID_H264)
     av_opt_set(cctx, "preset", "ultrafast", 0);
   else if (stream->codecpar->codec_id == AV_CODEC_ID_H265)
     av_opt_set(cctx, "preset", "ultrafast", 0);
+*/
+//  if (oformat->flags & AVFMT_GLOBALHEADER)
+//    cctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
 
   avcodec_parameters_from_context(stream->codecpar, cctx);
   if ((err = avcodec_open2(cctx, codec, NULL)) < 0) {
@@ -202,11 +215,6 @@ int videoOpen()
         return -1;
     }
   }
-
-
-  if (oformat->flags & AVFMT_GLOBALHEADER)
-    cctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
-//  cctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
 
   AVDictionary *fmtOptions = nullptr;
   av_dict_set(&fmtOptions, "movflags", "faststart", 0);
