@@ -8,11 +8,17 @@
 #include <eutils/etable.h>
 #include <eutils/vector3.h>
 
+#include <eutils/ethread.h>
+
 #include <deque>
 
 #include "videoenc.h"
 
 using namespace std;
+
+const int vwidth=1024;
+const int vheight=768;
+
 
 typedef ebasicarray<uint32_t> euintarray;
 
@@ -35,7 +41,7 @@ int binomial(int n,double p,const ernd& r)
 template<class T>
 void permute(T& arr,int s,int l,ernd& r){
   for (int i=0; i<l-1; ++i){
-    int ir=r.uniformint(l);
+    int ir=i+r.uniformint(l-i);
     if (ir==i) continue;
     swap(arr[s+i],arr[s+ir]);
   }
@@ -64,6 +70,7 @@ void permute(ebasicarray<uint8_t>& pop_ages,int ind,int size,ernd& r){
 */
 
 edoublearray delay_gamma(double mu,double shape,double tmax,double tstep);
+
 
 
 class rgamma
@@ -114,6 +121,7 @@ struct sevent {
 
 class evqueuelist;
 struct ssimstate;
+struct sthreadState;
 
 /*
 class elevel
@@ -148,7 +156,7 @@ class evqueuelist
   evqueuelist();
 
   deque<sevent>& step();
-  void add(ssimstate& st,int hpos,uint8_t hgroup,uint8_t hhsize,uint8_t hhexp,euintarray& count,const edoublearray& evdist,ernd& r,int ntransition=0);
+  void add(ssimstate& st,sthreadState& ths,int hpos,uint8_t hgroup,uint8_t hhsize,uint8_t hhexp,euintarray& count,const edoublearray& evdist,ernd& r,int ntransition=0);
   void add(ssimstate& st,sevent& ev,int newt);
   void resize(int newsize);
 };
@@ -167,6 +175,28 @@ struct sgrid
   int hhIa[ngroups][nlevels];
   int hhIp[ngroups][nlevels];
   int hhIs[ngroups][nlevels];
+};
+
+
+typedef void (*threadFunc_t)(ssimstate&,sthreadState&,int,int);
+
+struct sthreadState {
+  ernd r;
+//  int tI=0;
+//  int tN=0;
+
+  evqueuelist evqueue;
+
+  int allE=0;
+  int allCases=0;
+
+  int Ip[ngroups]={0,0};
+  int Is[ngroups]={0,0};
+  int Ia[ngroups]={0,0};
+
+  int allICU=0;
+  int allNonICU=0;
+  int allD=0;
 };
 
 struct ssimstate {
@@ -224,18 +254,53 @@ struct ssimstate {
 //  earray<eintarray> hhIa,hhIp,hhIs;
 
   int allE=0;
+  int allCases=0;
 
   int N[ngroups]={0,0};
   int Ip[ngroups]={0,0};
   int Is[ngroups]={0,0};
   int Ia[ngroups]={0,0};
 
-  double allICU,allNonICU,allD;
+  int allICU=0;
+  int allNonICU=0;
+  int allD=0;
 
-  evqueuelist evqueue;
+  edoublearray localIprob;
+  edoublearray travelKernel;
+  int travelKernelSize=0;
+
+//  evqueuelist evqueue;
+  double soldr=1.0;
+  double smr=1.0;
+  double finter=1.0;
+  double fintra=1.0;
+  double fglobal=0.001;
+  double flocal=1.0;
+
+  double R0day=R0/5.0;
+
+  int householdSize=7;
+
+  int fseed=10;
+  int seedGrid=0;
+
+  emutex mutex;
+  econdsig stateSignal;
+  econdsig doneSignal;
+
+  int nthreads=4;
+
+  threadFunc_t threadFunc=0x00;
+  earray<sthreadState> threadStates;
+  int threadI=0;
+  int threadDone=0;
+
+  eintarray gridShuffle;  // needed to load balance threads
 };
 
-void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
+
+
+void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
 {
   for (int i=0; i<evs.size(); ++i){
     sevent &e(evs[i]);
@@ -245,28 +310,28 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
 
     switch(e.transition){
       case 0:{ // end of E state
-        if (rnd.uniform()<st.rSA){
+        if (r.uniform()<st.rSA){
           // E -> Ip
-          ++st.Ip[hs.group];
+          ++ths.Ip[hs.group];
           ++g.Ip[hs.group];
           ++g.hhIp[hs.group][hl];
           ++hs.Ip;
           e.transition=2;
-          st.evqueue.add(st,e,st.rIp(r));
+          ths.evqueue.add(st,e,st.rIp(r));
         }else{
           // E -> Ia
-          ++st.Ia[hs.group];
+          ++ths.Ia[hs.group];
           ++g.Ia[hs.group];
           ++g.hhIa[hs.group][hl];
           ++hs.Ia;
           e.transition=1;
-          st.evqueue.add(st,e,st.rIa(r));
+          ths.evqueue.add(st,e,st.rIa(r));
         }
        break;
       }
       case 1:{
         // Ia ->
-        --st.Ia[hs.group];
+        --ths.Ia[hs.group];
         --g.Ia[hs.group];
         --g.hhIa[hs.group][hl];
         --hs.Ia;
@@ -274,33 +339,34 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
       }
       case 2:{
         // Ip -> Is , Ip -> toicu , Ip -> tononicu , Ip -> death
-        --st.Ip[hs.group];
+        --ths.Ip[hs.group];
         --g.Ip[hs.group];
         --g.hhIp[hs.group][hl];
         --hs.Ip;
-        ++st.Is[hs.group];
+        ++ths.allCases;
+        ++ths.Is[hs.group];
         ++g.Is[hs.group];
         ++g.hhIs[hs.group][hl];
         ++hs.Is;
         e.transition=3;
-        st.evqueue.add(st,e,st.rIs(r));
-        double rf=rnd.uniform();
+        ths.evqueue.add(st,e,st.rIs(r));
+        double rf=r.uniform();
         rf-=st.icu_symp[e.age];
         if (rf<0.0){
           e.transition=4;
-          st.evqueue.add(st,e,st.rToicu(r));
-          if (rnd.uniform()<st.death_icu[e.age]){
+          ths.evqueue.add(st,e,st.rToicu(r));
+          if (r.uniform()<st.death_icu[e.age]){
             e.transition=6;
-            st.evqueue.add(st,e,st.rIpDeath(r));
+            ths.evqueue.add(st,e,st.rIpDeath(r));
           }
         }else{
           rf-=st.nonicu_symp[e.age];
           if (rf<0.0){
             e.transition=5;
-            st.evqueue.add(st,e,st.rTononicu(r));
-            if (rnd.uniform()<st.death_nonicu[e.age]){
+            ths.evqueue.add(st,e,st.rTononicu(r));
+            if (r.uniform()<st.death_nonicu[e.age]){
               e.transition=6;
-              st.evqueue.add(st,e,st.rIpDeath(r));
+              ths.evqueue.add(st,e,st.rIpDeath(r));
             }
           }
         }
@@ -308,7 +374,7 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
       }
       case 3:{
         // Ip -> 
-        --st.Is[hs.group];
+        --ths.Is[hs.group];
         --g.Is[hs.group];
         --g.hhIs[hs.group][hl];
         --hs.Is;
@@ -318,32 +384,32 @@ void processEvents(ssimstate& st,deque<sevent>& evs,ernd& r)
         // TODO: remove individual from population (stop being infective) once he joins ICU or nonICU, requires keeping track of individual to make sure he is not removed twice, once from Is -> and another time from the ICU, nonICU or death cases, maybe use age value as flag when -1 means he already was removed
 
         // toicu -> icu
-        ++st.allICU;
+        ++ths.allICU;
         e.transition=7;
-        st.evqueue.add(st,e,st.rInicu(r));
+        ths.evqueue.add(st,e,st.rInicu(r));
        break;
       }
 
       case 5:{
         // tononicu -> nonicu
-        ++st.allNonICU;
+        ++ths.allNonICU;
         e.transition=8;
-        st.evqueue.add(st,e,st.rInnonicu(r));
+        ths.evqueue.add(st,e,st.rInnonicu(r));
        break;
       }
       case 6:{
         // death
-        ++st.allD;
+        ++ths.allD;
        break;
       }
       case 7:{
         // icu -> 
-        --st.allICU;
+        --ths.allICU;
        break;
       }
       case 8:{
         // nonicu -> 
-        --st.allNonICU;
+        --ths.allNonICU;
        break;
       }
     }
@@ -369,14 +435,14 @@ void evqueuelist::add(ssimstate &st,sevent& ev,int newt)
   eventarr[(ip+newt)%eventarr.size()].push_back(ev);
 }
 
-void evqueuelist::add(ssimstate &st,int hpos,uint8_t hgroup,uint8_t hhsize,uint8_t hhexp,euintarray& count,const edoublearray& evdist,ernd& r,int ntransition)
+void evqueuelist::add(ssimstate &st,sthreadState& ths,int hpos,uint8_t hgroup,uint8_t hhsize,uint8_t hhexp,euintarray& count,const edoublearray& evdist,ernd& r,int ntransition)
 {
   sevent ev;
   uint8_t hl=hhsize*int(hhsize+1)/2+(hhsize-hhexp);
 //  uint8_t hhstnewlevel=hhsize*(hhsize+1)/2+(hhsize-(hhexp+1)); // increasing exposed count in household
 
   for (int ti=1; ti<count.size(); ++ti)
-    st.allE+=count[ti]*ti;
+    ths.allE+=count[ti]*ti;
 
   ev.transition=ntransition; // default: 0 = end of E state
 
@@ -465,6 +531,7 @@ deque<sevent>& evqueuelist::step()
 int samplehh(eintarray& arr,ebasicarray<shousehold>& hhs,int s,ernd& r){
   int scount;
   int i;
+  int tries=0;
   do{
     scount=0;
     for (i=0; i<arr.size() && scount < s; ++i){
@@ -473,7 +540,8 @@ int samplehh(eintarray& arr,ebasicarray<shousehold>& hhs,int s,ernd& r){
       if (ir!=arr.size()-1-i)
         swap(arr[ir],arr[arr.size()-1-i]);
     }
-  } while (scount!=s);
+    ++tries;
+  } while (scount!=s && tries<50);
   return(i);
 }
 
@@ -584,6 +652,7 @@ int rheight=0;
 int imaxpop=-1;
 
 eintarray popCounts;
+ebasicarray<uint8_t> gridMask;
 
 inline int readPopDensR(uint32_t ix,uint32_t iy){
 //  return(raster[iy*rwidth + ix]==nodataval?0.0:raster[iy*rwidth + ix]); // nodata values are already zeroed
@@ -593,12 +662,10 @@ inline int readPopDensR(uint32_t ix,uint32_t iy){
 
 uint32_t v3_col(const evector3& v){ return(0xFFu&uint32_t(v.x*0xFFu) | 0xFF00u&uint32_t(v.y*0xFF00u) | 0xFF0000u&uint32_t(v.z*0xFF0000)); }
 
-/*
-uint32_t tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
+uint32_t tricolorint(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
   evector3 col12=col1*(1.0-p1)+col2*p1;
   return(v3_col((col1*(1.0-p1)+col2*p1)*(1.0-p2)+col3*p2));
 }
-*/
 
 evector3 tricolor(const evector3& col1,const evector3& col2,const evector3& col3,double p1,double p2){
   evector3 col12=col1*(1.0-p1)+col2*p1;
@@ -621,9 +688,9 @@ double revproj(double lon,double lat,double reflon){
   return(lon/cos(M_PI*lat/180.0)+reflon + lonMin);
 }
 
+
 void cairoDrawShape(cairo_t *cr,SHPObject *shp,float x,float y,float s,bool projection,float height,bool inverted){
   for (int j=0, iPart=1; j<shp->nVertices; ++j){
-    
     float sx=s*(shp->padfX[j]-shp->dfXMin)+x;
     if (projection)
       sx=s*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+x;
@@ -647,15 +714,10 @@ void cairoDrawShape(cairo_t *cr,SHPObject *shp,float x,float y,float s,bool proj
 }
 
 
-void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int width,int height){
+void renderFrame(int day,float mitigation,int newCases,uint8_t *frameRaw,ssimstate& st,int width,int height){
 //  memset(frameRaw, 0, 1920*1080*4);
-  for (int i=0; i<1920*1080*4; i+=4){
-    frameRaw[i]=0xff;
-    frameRaw[i+1]=0xff;
-    frameRaw[i+2]=0xff;
-    frameRaw[i+3]=0x00;
-  }
-
+//  videoPushFrame(frameRaw);
+//  return;
   if ((lonMax-lonMin)/(psShape->dfYMax-psShape->dfYMin) > double(width)/height){
     scale=width/(lonMax-lonMin);
     ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
@@ -677,6 +739,44 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
     if (maxE<tmpE) maxE=tmpE;
   }
 
+  for (int i=0; i<vwidth*vheight*4; i+=4){
+    frameRaw[i]=0xff;
+    frameRaw[i+1]=0xff;
+    frameRaw[i+2]=0xff;
+    frameRaw[i+3]=0x00;
+  }
+
+  for (int i=0; i<st.spGridW; ++i){
+    for (int j=0; j<st.spGridH; ++j){
+      double xlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylat=(st.spGridH-j-1)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+      double xlonn=(i+1)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+      double ylatn=(st.spGridH-j)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+      double sx=scale*(proj(xlon,ylat,lonRef)-lonMin)+xpos;
+      double sy=height-scale*(ylat-psShape->dfYMin)-ypos;
+
+      double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos+1.0; // 1.0 is added to avoid tears
+      double syn=height-scale*(ylatn-psShape->dfYMin)-ypos-1.0;
+
+      sgrid &g(st.spGrid[j*st.spGridW+i]);
+      double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
+      double tmpE=(g.N[0]+g.N[1]==0?0.0:double(g.E)/(g.N[0]+g.N[1]));
+      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.5)-log(0.5))/(log(rmaxpop+0.5)-log(0.5))*0.6+0.4);
+      uint32_t color=tricolorint(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+      if (gridMask[j*st.spGridW+i]==0)
+        color=0xFFFFFF;
+      colorRect(frameRaw,sx,sy,sxn,syn,color,width);
+    }
+  }
+
+/*
+  cairo_rectangle(cr,0.0,0.0,vwidth,vheight);
+  cairo_set_source_rgb(cr, 1.0,1.0,1.0);
+  cairo_fill(cr);
+
+  evector3 color;
   for (int i=0; i<st.spGridW; ++i){
     for (int j=0; j<st.spGridH; ++j){
 //      double sxlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
@@ -698,12 +798,14 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
       double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
 //      double tmpE=double(g.E)/(g.N[0]+g.N[1]);
       double tmpE=(g.N[0]+g.N[1]==0?0.0:double(g.E)/(g.N[0]+g.N[1]));
-      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.001)-log(0.001))/(log(rmaxpop+0.001)-log(0.001))*0.6+0.4);
+      float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.5)-log(0.5))/(log(rmaxpop+0.5)-log(0.5))*0.6+0.4);
 //      float pdens=clamp(0.0,1.0,readPopDensR(i+rxmin,rymax-j)/maxpdens*0.6+0.4);
 //      float pdens=clamp(0.0,1.0,readPopDens(i*(psShape->dfXMax-psShape->dfXMin)/100.0+psShape->dfXMin,j*(psShape->dfYMax-psShape->dfYMin)/100.0+psShape->dfYMin)/maxpdens);
 //      uint32_t color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
 //      colorRect(frameRaw,sx,sy,sxn,syn,color,width);
-      evector3 color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+      color=tricolor(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(0.0,0.0,1.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+      if (gridMask[j*st.spGridW+i]==0)
+        color=evector3(1.0,1.0,1.0);
       cairo_move_to(cr,sx,sy);
       cairo_line_to(cr,sxn,sy);
       cairo_line_to(cr,sxn,syn);
@@ -713,22 +815,35 @@ void renderFrame(int day,float mitigation,uint8_t *frameRaw,ssimstate& st,int wi
       cairo_fill(cr);
     }
   }
-
+*/
 
   // tell cairo we have changed the image contents
-//  cairo_surface_mark_dirty(surface);
+  cairo_surface_mark_dirty(surface);
 
+/*
   cairoDrawShape(cr,psShape,xpos,ypos,scale,true,height,true);
   cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_set_line_width(cr, 1);
   cairo_stroke (cr);
+*/
 
+  cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_move_to (cr, 10.0, 50.0);
   cairo_show_text (cr, (estr("Day: ")+day)._str);
-  cairo_move_to (cr, 10.0, 1080.0-50.0);
-  cairo_show_text (cr, estr().sprintf("Fraction exposed: %.3lf",double(st.allE)/(st.N[0]+st.N[1]))._str);
+  cairo_move_to (cr, 10.0, 100.0);
+  cairo_show_text (cr, estr().sprintf("All cases: %.0lf",double(st.allCases))._str);
+  cairo_move_to (cr, 10.0, 130.0);
+  cairo_show_text (cr, estr().sprintf("New cases: %.0lf",double(newCases))._str);
+  cairo_move_to (cr, 10.0, 160.0);
+  cairo_show_text (cr, estr().sprintf("in ICU: %.0lf",double(st.allICU))._str);
+  cairo_move_to (cr, 10.0, 190.0);
+  cairo_show_text (cr, estr().sprintf("in nonICU: %.0lf",double(st.allNonICU))._str);
+  cairo_move_to (cr, 10.0, 220.0);
+  cairo_show_text (cr, estr().sprintf("Fatalities: %.0lf",double(st.allD))._str);
+  cairo_move_to (cr, 10.0, vheight-32.0);
+  cairo_show_text (cr, estr().sprintf("Exposed: %.1lf%%",double(st.allE)*100.0/(st.N[0]+st.N[1]))._str);
   if (mitigation<1.0){
-    cairo_move_to (cr, 10.0, 190.0);
+    cairo_move_to (cr, 10.0, vheight-64.0);
     cairo_show_text (cr, estr().sprintf("Mitigation: %.2lf",mitigation)._str);
   }
 
@@ -753,6 +868,8 @@ void initCairo(uint8_t *frameRaw,int width,int height)
   cout << "# stride ARGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32,width) << endl;
   ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
   cr=cairo_create(surface); 
+  cairo_set_antialias(cr,CAIRO_ANTIALIAS_NONE);
+//  cairo_set_antialias(cr,CAIRO_ANTIALIAS_FAST);
 
   cairo_select_font_face (cr, "serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
   cairo_set_font_size (cr, 32.0);
@@ -957,6 +1074,12 @@ int loadPopDens(const estr& fname){
   return(0);
 }
 
+int getGrid(double lat,double lon)
+{
+  if (psShape->dfYMin>lat || psShape->dfYMax<lat || psShape->dfXMin>lon || psShape->dfXMax<lon) return(-1);
+  return((rheight-uint32_t((lat-psShape->dfYMin)*rheight/(psShape->dfYMax-psShape->dfYMin)))*rwidth+uint32_t((lon-psShape->dfXMin)*rwidth/(psShape->dfXMax-psShape->dfXMin)));
+}
+
 void adjustPopCounts(int popsize)
 {
   cairo_surface_t *surfacemask=0x00;
@@ -982,19 +1105,24 @@ void adjustPopCounts(int popsize)
   cairo_surface_flush(surfacemask);
   cairo_destroy(crmask);
   cairo_surface_destroy(surfacemask);
+ 
+  
+  gridMask.init(rwidth*rheight);
+  for (int i=0; i<rheight; ++i){
+    for (int j=0; j<rwidth; ++j)
+      gridMask[i*rwidth+j]=shapeMask[i*shapeRow+j];
+  }
+  delete[] shapeMask;
 
   rpopsize=0;
   rmaxpop=0;
   imaxpop=0;
   int totalpopsize=0;
-  for (int ix=0; ix<rwidth; ++ix){
-    for (int iy=0; iy<rheight; ++iy){
-      int i=iy*rwidth+ix;
-      totalpopsize+=popCounts[i];
-      if (shapeMask[iy*shapeRow+ix]==0) { popCounts[i]=0; continue; }
-      if (popCounts[i]>rmaxpop) { imaxpop=i;  rmaxpop=popCounts[i]; }
-      rpopsize+=popCounts[i];
-    }
+  for (int i=0; i<popCounts.size(); ++i){
+    totalpopsize+=popCounts[i];
+    if (gridMask[i]==0) { popCounts[i]=0; continue; }
+    if (popCounts[i]>rmaxpop) { imaxpop=i;  rmaxpop=popCounts[i]; }
+    rpopsize+=popCounts[i];
   }
   cout << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
   cout << "rmaxpop: " << popCounts[imaxpop] << endl;
@@ -1028,12 +1156,11 @@ void adjustPopCounts(int popsize)
   cout << "adjusted rmaxpop: " << rmaxpop << endl;
 
 
-  delete[] shapeMask;
 //  exit(0);
 }
 
 
-void loadShape(const estr& fname){
+void loadShape(const estr& fname,double lonLimit=-1000.0){
   SHPHandle hSHP;
   int nShapeType, nEntities;
   double adfMinBound[4],adfMaxBound[4];
@@ -1086,6 +1213,60 @@ void loadShape(const estr& fname){
 //    SHPDestroyObject(psShape);
 //  }
 
+  int tj=0;
+  int tiPart=1;
+
+  eintarray newParts;
+  newParts.add(0);
+  newParts.add(0);
+
+  // cut shape out of limits
+  for (int j=0,iPart=1; lonLimit>-1000.0 && j<psShape->nVertices; ++j){
+    if (iPart < psShape->nParts && psShape->panPartStart[iPart]==j){
+      ++iPart;
+      newParts.add(tj);
+    }
+    if (psShape->padfX[j]<lonLimit) continue;
+    if (j!=tj){
+      psShape->padfX[tj]=psShape->padfX[j];
+      psShape->padfY[tj]=psShape->padfY[j];
+    }
+    if (tj==0 || psShape->padfX[tj]<psShape->dfXMin) psShape->dfXMin=psShape->padfX[tj];
+    if (tj==0 || psShape->padfX[tj]>psShape->dfXMax) psShape->dfXMax=psShape->padfX[tj];
+    if (tj==0 || psShape->padfY[tj]<psShape->dfYMin) psShape->dfYMin=psShape->padfY[tj];
+    if (tj==0 || psShape->padfY[tj]>psShape->dfYMax) psShape->dfYMax=psShape->padfY[tj];
+    ++tj;
+    newParts[newParts.size()-1]=tj;
+  }
+  if (lonLimit>-1000.0){
+    for (int i=0; i<psShape->nParts; ++i)
+      cout << "i: "<< i << " " << psShape->panPartStart[i] << endl;
+    psShape->nParts=1;
+    for (int i=1,ti=1; i<newParts.size(); ++i){
+      if (newParts[i]>newParts[i-1]){
+        psShape->panPartStart[ti]=newParts[i];
+        ++ti;
+        ++psShape->nParts;
+      }
+    }
+    for (int i=0; i<psShape->nParts; ++i)
+      cout << "i: "<< i << " " << psShape->panPartStart[i] << endl;
+    cout << "Reduced shape with lonLimit: " << psShape->nVertices << " to " << tj << endl;
+    psShape->nVertices=tj;
+      printf( "\nNew Shape:%d (%s)  nVertices=%d, nParts=%d\n"
+                  "  Bounds:(%.*g,%.*g, %.*g)\n"
+                  "      to (%.*g,%.*g, %.*g)\n",
+                    0, SHPTypeName(psShape->nSHPType),
+                    psShape->nVertices, psShape->nParts,
+                    nPrecision, psShape->dfXMin,
+                    nPrecision, psShape->dfYMin,
+                    nPrecision, psShape->dfZMin,
+                    nPrecision, psShape->dfXMax,
+                    nPrecision, psShape->dfYMax,
+                    nPrecision, psShape->dfZMax ); 
+  }
+    
+
   lonRef=(psShape->dfXMax+psShape->dfXMin)/2.0;
   for (int j=0; j<psShape->nVertices; ++j){
     double tmpLon=proj(psShape->padfX[j],psShape->padfY[j],lonRef);
@@ -1112,17 +1293,216 @@ void loadShape(const estr& fname){
   SHPClose(hSHP);
 }
 
+void blurKernel(int i,int j,edoublearray& barr,edoublearray& arr,int w,edoublearray& k,int ks){
+  for (int ty=0; ty<ks; ++ty){
+    for (int tx=0; tx<ks; ++tx)
+      barr[(j+ty-ks/2)*w+i+tx-ks/2]+=k[ty*ks+tx]*arr[j*w+i];
+  }
+}
+
+double travelKernel(ssimstate& st,int gx,int gy)
+{
+  int tymin=MAX(0,gy-st.travelKernelSize/2)-gy+st.travelKernelSize/2;
+  int tymax=MIN(st.spGridH,gy+st.travelKernelSize/2+1)-gy+st.travelKernelSize/2;
+  int txmin=MAX(0,gx-st.travelKernelSize/2)-gx+st.travelKernelSize/2;
+  int txmax=MIN(st.spGridW,gx+st.travelKernelSize/2+1)-gx+st.travelKernelSize/2;
+
+  double prob=0.0;
+  double norm=0.0;
+  for (int ty=tymin; ty<tymax; ++ty){
+    for (int tx=txmin; tx<txmax; ++tx){
+      norm+=st.travelKernel[ty*st.travelKernelSize+tx];
+      prob+=st.travelKernel[ty*st.travelKernelSize+tx]*st.localIprob[(gy-st.travelKernelSize/2+ty)*st.spGridW+gx-st.travelKernelSize/2+tx];
+    }
+  }
+  return(prob/norm);
+}
+
+
+void blur(edoublearray& barr,edoublearray& arr,int w,int h,edoublearray& k,int ks)
+{
+  for (int i=0; i<barr.size(); ++i)
+    barr[i]=0.0;
+  for (int j=ks/2; j<h-ks/2; ++j)
+    for (int i=ks/2; i<w-ks/2; ++i)
+      blurKernel(i,j,barr,arr,w,k,ks);
+}
+
+
+void threadLocalInfection(ssimstate& st,sthreadState& ths,int i,int n)
+{
+  for (int ti=st.spGrid.size()*i/n; ti<st.spGrid.size()*(i+1)/n && ti<st.spGrid.size(); ++ti){
+    int gi=st.gridShuffle[ti];
+    sgrid& g(st.spGrid[gi]);
+    if (g.N[0]+g.N[1]==0) { st.localIprob[gi]=0.0; continue; }
+    st.localIprob[gi]=st.finter*st.R0day*(0.5*g.Ia[0]+g.Ip[0]+g.Is[0] + (MIN(st.smr,st.soldr)/st.smr)*(0.5*g.Ia[1]+g.Ip[1]+g.Is[1]) )/(g.N[0]+(MIN(st.smr,st.soldr)/st.smr)*g.N[1]);
+  }
+}
+
+void threadUpdateGrid(ssimstate& st,sthreadState& ths,int i,int n)
+{
+  // todo: include this in thread state
+  edoublearray mp;
+  euintarray counts;
+
+  double globalIprob=st.finter*st.fglobal*st.R0day*(0.5*st.Ia[0]+st.Ip[0]+st.Is[0] + (MIN(st.smr,st.soldr)/st.smr)*(0.5*st.Ia[1]+st.Ip[1]+st.Is[1]) )/(st.N[0]+(MIN(st.smr,st.soldr)/st.smr)*st.N[1]);
+
+  for (int ti=st.spGrid.size()*i/n; ti<st.spGrid.size()*(i+1)/n && ti<st.spGrid.size(); ++ti){
+    int gi=st.gridShuffle[ti];
+    sgrid& g(st.spGrid[gi]);
+    if (g.N[0]+g.N[1]==0) { continue; } // skip empty grid
+
+    int gx=gi%st.spGridW;
+    int gy=gi/st.spGridW;
+
+    int giup=((st.spGridH+gy-1)%st.spGridH)*st.spGridW+gx;
+    int gidn=((gy+1)%st.spGridH)*st.spGridW+gx;
+    int gilt=gy*st.spGridW+(st.spGridW+gx-1)%st.spGridW;
+    int girt=gy*st.spGridW+(gx+1)%st.spGridW;
+
+    // TODO: handle adjacent empty grids or big differences in population sizes. How should they affect the probability of infection of an adjacent grid?
+//    double tmpLocalIprob=localIprobGaussian[gi]*flocal; // + localIprob[gilt]*(1.0-flocal);
+//    double tmpLocalIprob=localIprob[gi]*flocal; // + localIprob[gilt]*(1.0-flocal);
+//    double tmpLocalIprob=st.localIprob[gi]*0.6 + st.localIprob[gilt]*0.1 + st.localIprob[girt]*0.1 + st.localIprob[giup]*0.1 + st.localIprob[gidn]*0.1;
+    double tmpLocalIprob=travelKernel(st,gx,gy);
+
+    for (int hg=0; hg<ngroups; ++hg){
+      for (int hhsize=1; hhsize<st.householdSize; ++hhsize){ // TODO: should move levels to outter loop for efficiency, inner loop should be longest sequential array of data
+        for (int hhexp=hhsize-1; hhexp>=0; --hhexp){ // NOTE: have to do decreasing here to avoid infecting twice the same house in the same step
+
+          uint8_t hl=hhsize*(hhsize+1)/2+(hhsize-hhexp);
+          unsigned int hlcount=st.hhLevelsBegin[gi*st.grow + hg*st.arow + hl+1]-st.hhLevelsBegin[gi*st.grow + hg*st.arow +hl];
+          if (hlcount==0) continue; // no households in level
+
+          int hS=hhsize-hhexp; // number of susceptible individuals per household
+          int nS=hlcount*hS; // total number of susceptible individuals in these households
+
+          // The intra household rate below is an approximation needed to avoid computing the exact probability of new infection per household which depends on the specific combination of Ia,Is and Ip
+          double intraIprob=st.fintra*st.R0day*(0.5*g.hhIa[hg][hl]+g.hhIp[hg][hl]+g.hhIs[hg][hl])/nS;
+  
+          double p=(MIN(st.smr,(hg>=1?st.soldr:1.0))*(globalIprob + tmpLocalIprob) + intraIprob)*st.tstep; // probability of infection per susceptible person in these households
+  
+          mp.clear();
+          mp.add(0.0);
+          mp.add(p*hS);
+          mp[0]+=p*hS;
+//          for (int ti=0; ti<hS; ++ti){
+//            mp.add(p*(hS-ti));
+//            mp[0]+=p*(hS-ti); //TODO: need to add a term for combinations of ti into hS
+//            p=p*p; // probability of more than 1 infection occuring
+//          }
+          mp[0]=1.0-mp[0]; // probability of household having no infection
+          counts.init(mp.size(),0);
+          multinomial(hlcount,mp,counts,ths.r);
+         
+  //        int newE=binomial(nS,,rnd)/(hhsize-hhexp);
+  //        if (newE>st.hhLevels[hhstlevel].size()) newE=st.hhLevels[hhstlevel].size(); // cap maximum number of new household exposures
+ 
+          // each thread has its own event queue since every grid is independent of each other this ensures there are no race conditions over data access
+          ths.evqueue.add(st,ths,gi,hg,hhsize,hhexp,counts,st.dE,ths.r);
+//          st.evqueue.add(st,gi,hg,hhsize,hhexp,counts,st.dE,rnd);
+        }
+      }
+    }
+  }
+  deque<sevent> &nextEvents(ths.evqueue.step());
+  processEvents(st,ths,nextEvents,ths.r);
+}
+
+/*
+void threadUpdateEvents(ssimstate& st,sthreadState& ths,int i,int n,ernd& r)
+{
+  deque<sevent> &nextEvents(ths.evqueue.step());
+  processEvents(st,ths,nextEvents,r);
+}
+*/
+
+void threadSeedInfections(ssimstate& st,sthreadState& ths,int i,int n)
+{
+//  if (st.seedGrid < st.spGrid.size()*i/n || st.seedGrid >= st.spGrid.size()*(i+1)/n) return;
+  st.mutex.lock();
+  cout << "i: " << i << " n: " << n << " " << st.spGrid.size()*i/n << " " << st.spGrid.size()*(i+1)/n << " " << st.spGrid.size() << endl;
+  st.mutex.unlock();
+
+
+  bool found=false;
+  for (int ti=st.spGrid.size()*i/n; ti<st.spGrid.size()*(i+1)/n && ti<st.spGrid.size(); ++ti){
+    int gi=st.gridShuffle[ti];
+    if (st.seedGrid==gi){ found=true; break; }
+  }
+  if (!found) return;
+
+  cout << "# seeding initial infected: " << st.fseed << endl;
+
+  // seed infections
+  edoublearray mp;
+  euintarray counts;
+
+  counts.init(3,0);
+  counts[1]=st.fseed;
+  ths.evqueue.add(st,ths,st.seedGrid,0,2,0,counts,st.dE,ths.r);  // add Exposed to grid position with highest population count
+}
+
+void threadRun(ssimstate &st)
+{
+//  sthreadState ths;
+  int threadI=-1;
+  threadFunc_t threadFunc=0x00;
+
+  do {
+    st.mutex.lock();
+    
+    --st.threadDone;
+    // assign thread ID, needs to be fixed such that each thread handles always the same grid positions
+//    if (threadI==-1){
+//      threadI=st.threadDone;
+//      cout << st.threadDone << endl;
+//    }
+
+    // copy thead state
+    if (threadI>=0){
+      sthreadState &ths(st.threadStates[threadI]);
+      st.allCases+=ths.allCases;
+      ths.allCases=0;
+      st.allE+=ths.allE;
+      ths.allE=0;
+      st.allICU+=ths.allICU; ths.allICU=0;
+      st.allNonICU+ths.allNonICU; ths.allNonICU=0;
+      st.allD+=ths.allD; ths.allD=0;
+      for (int i=0; i<ngroups; ++i){
+        st.Ip[i]+=ths.Ip[i];
+        st.Is[i]+=ths.Is[i];
+        st.Ia[i]+=ths.Ia[i];
+        ths.Ip[i]=0; ths.Is[i]=0; ths.Ia[i]=0;
+      }
+    }
+
+    st.doneSignal.signal();
+    while (st.threadI==0) st.stateSignal.wait(st.mutex);
+
+    threadFunc=st.threadFunc;
+    --st.threadI;
+    threadI=st.threadI;
+//    cout << "Thread i: " << threadI << endl;
+    st.mutex.unlock();
+
+    if (threadFunc)
+      (*threadFunc)(st,st.threadStates[threadI],threadI,st.nthreads);
+  } while(threadFunc);
+}
+
+
 
 int emain()
 {
   ssimstate st;
   epregister2(st.R0,"r0");
 
-  int avgage=0; // take most age of first individual (usually the oldest), or the avg age of the household for the household age group
-  epregister(avgage);
+//  int avgage=0; // take most age of first individual (usually the oldest), or the avg age of the household for the household age group
+//  epregister(avgage);
 
-  double finter=1.0;
-  double fintra=1.0;
+//  double finter=1.0;
+//  double fintra=1.0;
 
   double foldr=1.0; // isolation for households with older members
   int tostart=-1; // start isolation
@@ -1140,16 +1520,47 @@ int emain()
 
   double tmax=300.0;
   epregister(tmax);
-  epregister(finter);
-  epregister(fintra);
-  double fglobal=0.01;
-  epregister(fglobal);
+  epregister2(st.finter,"finter");
+  epregister2(st.fintra,"fintra");
+//  double fglobal=0.001;
+  epregister2(st.fglobal,"fglobal");
+//  double flocal=1.0;
+  epregister2(st.flocal,"flocal");
   estr fpop="data/switzerland.agegroups";
   epregister(fpop);
-  int fseed=10;
-  epregister(fseed);
+  estr fshape="data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp";
+  epregister(fshape);
+//  int fseed=10;
+  epregister2(st.fseed,"fseed");
+
+
+//  int nthreads=4;
+  epregister2(st.nthreads,"nthreads");
+
+  double ftravel=0.2;
+  epregister(ftravel);
+
+  estrarray events;
+  epregister(events);
+
+  double lonLimit=-1000.0;
+  epregister(lonLimit);
+
+  double fsinglehh=0.0;
+  epregister(fsinglehh);
+  double flargehh=0.0;
+  epregister(flargehh);
+
 
   eparseArgs();
+
+
+  estrarray tmparr;
+  earrayof<double,int> eventsArr;
+  for (int i=0; i<events.size(); ++i){
+    tmparr=events[i].explode(":");
+    eventsArr.add(tmparr[0].i(),tmparr[1].f());
+  }
 
   cout << "# R0: " << st.R0 << endl;
 
@@ -1177,14 +1588,14 @@ int emain()
 
   cout << "# total population: " << popsize << endl;
 
-  loadShape("data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp");
+  loadShape(fshape,lonLimit);
 //  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
 
   loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif"); // loads population counts raster data
 
   //TODO: cleanup the dependecies to make them explicit between the initializations and loading of data
-  uint8_t *frameraw = new uint8_t[1920*1080*4];
-  initCairo(frameraw,1920,1080); // initCairo after loadShape because it initializes a shapemask and after loading population raster data, to have a grid defined already
+  uint8_t *frameraw = new uint8_t[vwidth*vheight*4];
+  initCairo(frameraw,vwidth,vheight); // initCairo after loadShape because it initializes a shapemask and after loading population raster data, to have a grid defined already
 
   adjustPopCounts(popsize);
 
@@ -1201,15 +1612,16 @@ int emain()
 
   // Ferguson et al 2006 has household distribution sizes in supplementary graphs which the values below approximate
   // UK statistics have updated information on households
+  st.householdSize=7;
   eintarray householdSizeDist;
-  householdSizeDist.init(7,0.0); // how many households with single individuals, two individuals, ... max 6
+  householdSizeDist.init(st.householdSize,0.0); // how many households with single individuals, two individuals, ... max 6
   householdSizeDist[0]=0; // household with 0 susceptible
-  householdSizeDist[1]=0.25*popsize;      
-  householdSizeDist[2]=0.28*popsize/2.0;
-  householdSizeDist[3]=0.20*popsize/3.0; // 3 individual households, e.g.: two adults one child
-  householdSizeDist[4]=0.17*popsize/4.0;
-  householdSizeDist[5]=0.08*popsize/5.0;
-  householdSizeDist[6]=0.02*popsize/6.0;
+  householdSizeDist[1]=(0.25+fsinglehh-flargehh*0.5)*popsize; 
+  householdSizeDist[2]=(0.28-fsinglehh*0.2-flargehh*0.5)*popsize/2.0;
+  householdSizeDist[3]=(0.20-fsinglehh*0.4+flargehh*0.2)*popsize/3.0; // 3 individual households, e.g.: two adults one child
+  householdSizeDist[4]=(0.17-fsinglehh*0.3+flargehh*0.4)*popsize/4.0;
+  householdSizeDist[5]=(0.08-fsinglehh*0.1+flargehh*0.2)*popsize/5.0;
+  householdSizeDist[6]=(0.02+flargehh*0.2)*popsize/6.0;
 
   int total_households=0,total_hh_individuals=0;
   for (int i=0; i<householdSizeDist.size(); ++i){
@@ -1269,7 +1681,7 @@ int emain()
   st.rInnonicu=rgamma(8.0,8.0,60.0,0.25); // 8 days in nonICU
   st.rIpDeath=rgamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
 
-  double R0day=st.R0/5.0; // per day rate given that individuals are infectious for 5 days
+  st.R0day=st.R0/5.0; // per day rate given that individuals are infectious for 5 days
 
 
   st.hhLevels2.init(total_households);
@@ -1349,8 +1761,8 @@ int emain()
           ldieif(st.pop_ages[sh.ageind+1]<0 || st.pop_ages[sh.ageind+1]>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.pop_ages[sh.ageind+1])+" "+tmpag.size());
         } while (tmpag[st.pop_ages[sh.ageind+1]]==0);
         --tmpag[st.pop_ages[sh.ageind+1]];
-        if (avgage)
-          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
+//        if (avgage)
+//          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
         ++assigned;
       }   
       // Children
@@ -1371,8 +1783,8 @@ int emain()
         } while (tmpag[st.pop_ages[sh.ageind+l]]==0);
         --tmpag[st.pop_ages[sh.ageind+l]];
         ++assigned;
-        if (avgage)
-          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
+//        if (avgage)
+//          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
       }
     }
   }
@@ -1417,8 +1829,10 @@ int emain()
   for (int i=0; i<st.spGrid.size(); ++i){
     sgrid &g(st.spGrid[i]);
     int gpop=popCounts[i];
-    if (popsize-gpopAll<500) { cout << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << endl; }
-    if (gpop > popsize-gpopAll) { cout << "more individuals needed than available: " << gpop << " " << popsize-gpopAll <<endl; exit(-1); break; }
+    if (gpop==0) continue;
+
+    if (popsize-gpopAll<10000) { cout << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << "  gpop: " << gpop << endl; }
+    if (gpop > popsize-gpopAll) { cout << "more individuals needed than available: " << gpop << " " << popsize-gpopAll << " gpos: " << i << " gsize: " << st.spGrid.size() << endl; /*exit(-1);*/ break; }
     int hhcount=samplehh(hhids,st.households,gpop,rnd); // find a random set of hh that sum to popsize in the grid and put it at the end of hhids
     for (int l=0; l<hhcount; ++l){
       shousehold &hh(st.households[hhids[hhids.size()-1]]);
@@ -1429,7 +1843,7 @@ int emain()
       ++gassign;
       hhids.erase(hhids.size()-1);
     }
-    ldieif(gpop!=0,"gpop not zero? gpop: "+estr(gpop)+" i: "+estr(i));
+    ldieif(popsize-gpopAll>2000 && gpop!=0,"gpop not zero? gpop: "+estr(gpop)+" i: "+estr(i));
   }
   ldieif(popsize-gpopAll!=0 || hhids.size()>0,"seeding households on grid failed, population size: " + estr(popsize) + " individuals in households on grid: " +estr(gpopAll)+" households left: "+hhids.size());
 
@@ -1614,64 +2028,142 @@ int emain()
   }
 */
 
-  st.evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
-
-  edoublearray mp;
-  euintarray counts;
+//  st.evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
 
   double fE=0.0; // fraction of exposed (includes deaths, active infections and healed)
 
-  cout << "# seeding initial infected: " << fseed << endl;
-  // seed infections
-  counts.init(3,0);
-  counts[1]=fseed;
 
 //  st.allIp=fseed; // directly as presymptomatic
 //  st.evqueue.add(st,6,2,0,counts,st.dIp,rnd,2); 
 //  st.allE=fseed;
 //  cout << "hhLevelsBegin: " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2+1] << " " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
-  st.evqueue.add(st,imaxpop,0,2,0,counts,st.dE,rnd);  // add Exposed to grid position with highest population count
+  st.seedGrid=getGrid(46.0,8.95);
+  if (st.seedGrid==-1) { cout << "# coordinate not found chosing most populated area" << endl; st.seedGrid=imaxpop; }
+  else if (st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<st.fseed){
+    cout << "igrid: " << st.seedGrid << " levels empty, looking for another grid pos" << endl;
+    int ix=st.seedGrid%st.spGridW;
+    int ih=st.seedGrid/st.spGridW;
+    for ( ;ix<st.spGridW && st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<st.fseed; ++ix,++st.seedGrid);
+    cout << "seedGrid: " << st.seedGrid << " " << st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
+    if (ix==st.spGridW) { cout << "did not find any populated areas close to choice" << endl; st.seedGrid=imaxpop; }
+  }
+//  st.evqueue.add(st,igrid,0,2,0,counts,st.dE,rnd);  // add Exposed to grid position with highest population count
+
+  st.gridShuffle.init(st.spGrid.size());
+  for (int i=0; i<st.gridShuffle.size(); ++i)
+    st.gridShuffle[i]=i;
+  permute(st.gridShuffle,0,st.gridShuffle.size(),rnd);
+
 
   cout << "# starting simulation" << endl;
-
-  st.allICU=0.0;
-  st.allNonICU=0.0;
-  st.allD=0.0;
 
   double tpeak=0.0;
   double peakIs=0.0;
   double peakICU=0.0;
   double peakNonICU=0.0;
 
-  double soldr=1.0;
-  double smr=1.0;
+//  ldieif(videoOpen(1024,768,5,1000)!=0,"error creating video file");
+  ldieif(videoOpen(1024,768,3,500)!=0,"error creating video file");
 
-  ldieif(videoOpen()!=0,"error creating video file");
+//  edoublearray localIprob;
+//  edoublearray localIprobGaussian;
 
-  edoublearray localIprob;
-  localIprob.init(st.spGrid.size());
+/*
+  edoublearray gaussianKernel;
+  gaussianKernel.init(11*11,0.0);
+  gaussianKernel[11*5+5]=0.6;
+  gaussianKernel[11*6+5]=0.1;
+  gaussianKernel[11*4+5]=0.1;
+  gaussianKernel[11*5+4]=0.1;
+  gaussianKernel[11*5+6]=0.1;
+*/
+
+  st.travelKernel.init(11*11,0.0);
+  st.travelKernelSize=11;
+
+/*
+  st.travelKernel[11*5+5]=0.6;
+  st.travelKernel[11*6+5]=0.1;
+  st.travelKernel[11*4+5]=0.1;
+  st.travelKernel[11*5+4]=0.1;
+  st.travelKernel[11*5+6]=0.1;
+*/
+
+  double sump=0.0;
+  for (int i=0; i<11; ++i){
+    for (int j=0; j<11; ++j){
+      int xf=double(i-5),yf=double(j-5);
+      st.travelKernel[j*11+i]=gsl_ran_gaussian_pdf(sqrt(xf*xf+yf*yf),ftravel);
+      sump+=st.travelKernel[j*11+i];
+    }
+  }
+
+//  cout << gaussianKernel << endl;
+  for (int i=0; i<st.travelKernel.size(); ++i)
+    st.travelKernel[i]/=sump;
+
+
+  
+  st.localIprob.init(st.spGrid.size());
+
 
   cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
+
+  ethreads t;
+
+  t.setThreads(st.nthreads);
+  st.threadDone=st.nthreads;
+  for (int i=0; i<st.nthreads; ++i){
+    st.threadStates.addref(new sthreadState);
+    st.threadStates[i].evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
+  }
+
+  t.run(threadRun,evararray(evarRef(st)));
+
+  st.mutex.lock();
+  while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+  st.mutex.unlock();
+  cout << "#starting simulation" << endl;
+
+
+  st.mutex.lock();
+  st.threadFunc=threadSeedInfections; // update events 
+  st.threadI=st.nthreads;
+  st.threadDone=st.nthreads;
+  st.stateSignal.broadcast();
+  while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+  st.mutex.unlock();
+
+
+  int lastCases=0;
+
   for (int it=0; it*st.tstep<tmax; ++it){
-    renderFrame(it*st.tstep,smr,frameraw,st,1920,1080);
+    if (it%4==0){
+      renderFrame(it*st.tstep,st.smr,st.allCases-lastCases,frameraw,st,vwidth,vheight);
+      lastCases=st.allCases;
+    }
+    while (eventsArr.size()>0 && eventsArr.keys(0) <= it*st.tstep){
+      st.smr=eventsArr.values(0);
+      eventsArr.erase(0);
+    }
 
     if (tmstart>=0 && it*st.tstep >= tmstart){
-      smr=fmr;
+      st.smr=fmr;
       tmstart=-1;
     }
 
     if (tmend>0 && it*st.tstep >= tmend){
-      smr=1.0;
+      st.smr=1.0;
       tmend=-1;
     }
 
     if (tostart>=0 && it*st.tstep >= tostart){
-      soldr=foldr;
+      st.soldr=foldr;
       tostart=-1;
     }
 
     if (toend>0 && it*st.tstep >= toend){
-      soldr=1.0;
+      st.soldr=1.0;
       toend=-1;
     }
 
@@ -1690,7 +2182,7 @@ int emain()
 
     // Global probability of infection from random person in country (x0.01)
 //    double globalIprob=0.01 * finter*R0day*(0.5*st.allIa+st.allIp+st.allIs - (1.0-MIN(smr,soldr)/smr)*(0.5*st.oallIa+st.oallIp+st.oallIs) )/(popsize-(1.0-MIN(smr,soldr)/smr)*hhOlderN);
-    double globalIprob=finter*fglobal*R0day*(0.5*st.Ia[0]+st.Ip[0]+st.Is[0] + (MIN(smr,soldr)/smr)*(0.5*st.Ia[1]+st.Ip[1]+st.Is[1]) )/(st.N[0]+(MIN(smr,soldr)/smr)*st.N[1]);
+//    double globalIprob=st.finter*fglobal*R0day*(0.5*st.Ia[0]+st.Ip[0]+st.Is[0] + (MIN(smr,soldr)/smr)*(0.5*st.Ia[1]+st.Ip[1]+st.Is[1]) )/(st.N[0]+(MIN(smr,soldr)/smr)*st.N[1]);
 
     // removed the cap because its more conservative and because there are situations where there should be no cap. For a more accurate representation of reality need to model how transmission occurs
     // through contacts, considering how time spent and number of contacts influence the transmission probability, and what is the effect of the isolation measures on either of these two variables
@@ -1702,13 +2194,35 @@ int emain()
     // There are cases when this is not true, if the probability of infection is so high that it is enough to have a single contact even of very short duration to have a probability of 100% of getting infected and the proportion of infected is high enough to guarantee there is one infected person in almost every group of contacts, then reducing contact (either by decreasing the time or by decreasing the number of contacts) should correctly result in no reduced probability of infection, up to a certain point.
 
     fE=double(st.allE)/popsize;
+
+    st.mutex.lock();
+    st.threadFunc=threadLocalInfection; // update events 
+    st.threadI=st.nthreads;
+    st.threadDone=st.nthreads;
+    st.stateSignal.broadcast();
+    while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+    st.mutex.unlock();
+
+/*
     for (int gi=0; gi<st.spGrid.size(); ++gi){
       sgrid& g(st.spGrid[gi]);
       if (g.N[0]+g.N[1]==0) { localIprob[gi]=0.0; continue; }
-      // TODO: precompute all infection probabilities before updating data!
       localIprob[gi]=finter*R0day*(0.5*g.Ia[0]+g.Ip[0]+g.Is[0] + (MIN(smr,soldr)/smr)*(0.5*g.Ia[1]+g.Ip[1]+g.Is[1]) )/(g.N[0]+(MIN(smr,soldr)/smr)*g.N[1]);
     }
+*/
 
+//    blur(localIprobGaussian,localIprob,st.spGridW,st.spGridH,gaussianKernel,11);
+
+
+    st.mutex.lock();
+    st.threadFunc=threadUpdateGrid; // update events 
+    st.threadI=st.nthreads;
+    st.threadDone=st.nthreads;
+    st.stateSignal.broadcast();
+    while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+    st.mutex.unlock();
+
+/*
     for (int gi=0; gi<st.spGrid.size(); ++gi){
       sgrid& g(st.spGrid[gi]);
       if (g.N[0]+g.N[1]==0) { continue; } // skip empty grid
@@ -1722,6 +2236,8 @@ int emain()
       int girt=gy*st.spGridW+(gx+1)%st.spGridW;
 
       // TODO: handle adjacent empty grids or big differences in population sizes. How should they affect the probability of infection of an adjacent grid?
+//      double tmpLocalIprob=localIprobGaussian[gi]*flocal; // + localIprob[gilt]*(1.0-flocal);
+//      double tmpLocalIprob=localIprob[gi]*flocal; // + localIprob[gilt]*(1.0-flocal);
       double tmpLocalIprob=localIprob[gi]*0.6 + localIprob[gilt]*0.1 + localIprob[girt]*0.1 + localIprob[giup]*0.1 + localIprob[gidn]*0.1;
 
       for (int hg=0; hg<ngroups; ++hg){
@@ -1761,8 +2277,23 @@ int emain()
         }
       }
     }
-    deque<sevent> &nextEvents(st.evqueue.step());
+*/
+
+/*
+    st.mutex.lock();
+    st.threadFunc=threadUpdateEvents; // update events 
+    st.threadI=nthreads;
+    st.threadDone=nthreads;
+    st.stateSignal.signal();
+    while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+    st.mutex.unlock();
+*/
+
+/*
+    st.nextEvents=&nextEvents(st.evqueue.step());
     processEvents(st,nextEvents,rnd);
+*/
+
     cout << it*st.tstep << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 //    if (st.Ia[0]+st.Ia[1]+st.Is[0]+st.Is[1]+st.Ip[0]+st.Ip[1]==0) break;
   }
@@ -1770,6 +2301,14 @@ int emain()
   cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 
   cout << "# fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << endl;
+
+  st.mutex.lock();
+  st.threadI=st.nthreads;
+  st.threadFunc=0x00;
+  st.stateSignal.broadcast();
+  st.mutex.unlock();
+
+  t.wait();
 
   return(0);
 }
