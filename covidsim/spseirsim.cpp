@@ -9,6 +9,8 @@
 #include <eutils/vector3.h>
 
 #include <eutils/ethread.h>
+#include <eutils/edaemon.h>
+#include <eutils/esystem.h>
 
 #include <deque>
 
@@ -281,8 +283,10 @@ struct ssimstate {
 
   int householdSize=7;
 
-  int fseed=10;
-  int seedGrid=0;
+  earrayof<int,int> iseedArr;
+
+//  int fseed=10;
+//  int seedGrid=0;
 
   emutex mutex;
   econdsig stateSignal;
@@ -713,8 +717,38 @@ void cairoDrawShape(cairo_t *cr,SHPObject *shp,float x,float y,float s,bool proj
   }
 }
 
+/*
+// multithreaded rendering
+void threadRenderFrame(ssimstate& st,int i,int n){
+  for (int i=st.spGrid.size()*i/n; i<st.spGrid.size()*(i+1)/n && i<st.spGrid.size(); ++i){
+    int xi=i%st.spGridW;
+    int yi=i/st.spGridH;
 
-void renderFrame(int day,float mitigation,int newCases,uint8_t *frameRaw,ssimstate& st,int width,int height){
+    double xlon=xi*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+    double ylat=(st.spGridH-yi-1)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+    double xlonn=(xi+1)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
+    double ylatn=(st.spGridH-yi)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+
+    double sx=scale*(proj(xlon,ylat,lonRef)-lonMin)+xpos;
+    double sy=height-scale*(ylat-psShape->dfYMin)-ypos;
+
+    double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos+1.0; // 1.0 is added to avoid tears
+    double syn=height-scale*(ylatn-psShape->dfYMin)-ypos-1.0;
+
+    sgrid &g(st.spGrid[i]);
+    double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
+    double tmpE=(g.N[0]+g.N[1]==0?0.0:double(g.E)/(g.N[0]+g.N[1]));
+    float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.5)-log(0.5))/(log(rmaxpop+0.5)-log(0.5))*0.6+0.4);
+    uint32_t color=tricolorint(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
+    if (st.gridMask[i]==0)
+      color=0xFFFFFF;
+    colorRect(frameRaw,sx,sy,sxn,syn,color,width);
+  }
+}
+*/
+
+void renderFrame(char *daystr,float mitigation,int newCases,uint8_t *frameRaw,ssimstate& st,int width,int height){
 //  memset(frameRaw, 0, 1920*1080*4);
 //  videoPushFrame(frameRaw);
 //  return;
@@ -829,7 +863,7 @@ void renderFrame(int day,float mitigation,int newCases,uint8_t *frameRaw,ssimsta
 
   cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_move_to (cr, 10.0, 50.0);
-  cairo_show_text (cr, (estr("Day: ")+day)._str);
+  cairo_show_text (cr, daystr);
   cairo_move_to (cr, 10.0, 100.0);
   cairo_show_text (cr, estr().sprintf("All cases: %.0lf",double(st.allCases))._str);
   cairo_move_to (cr, 10.0, 130.0);
@@ -864,14 +898,14 @@ void initCairo(uint8_t *frameRaw,int width,int height)
 //  cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_RGB32, width, height);
   surface=cairo_image_surface_create_for_data(frameRaw,CAIRO_FORMAT_ARGB32,width,height,width*4);
   int cstatus=cairo_surface_status(surface);
-  cout << "# stride RGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_RGB24,width) << endl;
-  cout << "# stride ARGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32,width) << endl;
+  cerr << "# stride RGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_RGB24,width) << endl;
+  cerr << "# stride ARGB: " << cairo_format_stride_for_width (CAIRO_FORMAT_ARGB32,width) << endl;
   ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
   cr=cairo_create(surface); 
   cairo_set_antialias(cr,CAIRO_ANTIALIAS_NONE);
 //  cairo_set_antialias(cr,CAIRO_ANTIALIAS_FAST);
 
-  cairo_select_font_face (cr, "serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+  cairo_select_font_face (cr, "monospace", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
   cairo_set_font_size (cr, 32.0);
   cairo_set_source_rgb (cr, 0.0, 0.0, 1.0);
 }
@@ -894,27 +928,27 @@ static TIFFExtendProc _ParentExtender = NULL;
 
 static void _XTIFFDefaultDirectory(TIFF *tif)
 {
-    /* Install the extended Tag field info */
-    TIFFMergeFieldInfo(tif, xgdaltiffFieldInfo, TIFF_N(xgdaltiffFieldInfo));
+  /* Install the extended Tag field info */
+  TIFFMergeFieldInfo(tif, xgdaltiffFieldInfo, TIFF_N(xgdaltiffFieldInfo));
 
-    /* Since an XTIFF client module may have overridden
-     * the default directory method, we call it now to
-     * allow it to set up the rest of its own methods.
-     */
+  /* Since an XTIFF client module may have overridden
+   * the default directory method, we call it now to
+   * allow it to set up the rest of its own methods.
+   */
 
-    if (_ParentExtender) 
-        (*_ParentExtender)(tif);
+  if (_ParentExtender) 
+      (*_ParentExtender)(tif);
 }
 
 static void _XTIFFInitialize(void)
 {
-    static int first_time=1;
-	
-    if (! first_time) return; /* Been there. Done that. */
-    first_time = 0;
-	
-    /* Grab the inherited method and install */
-    _ParentExtender = TIFFSetTagExtender(_XTIFFDefaultDirectory);
+  static int first_time=1;
+
+  if (! first_time) return; /* Been there. Done that. */
+  first_time = 0;
+
+  /* Grab the inherited method and install */
+  _ParentExtender = TIFFSetTagExtender(_XTIFFDefaultDirectory);
 }
 
 
@@ -935,7 +969,7 @@ int loadPopDens(const estr& fname){
     return(-1);
   }
 
-  GTIFPrint(gtif,0,0);
+//  GTIFPrint(gtif,0,0);
 
   uint32_t ysize=0; //xsize declared above
   uint32_t xsize=0;
@@ -952,15 +986,15 @@ int loadPopDens(const estr& fname){
   TIFFGetField( tif, TIFFTAG_GDAL_NODATA, &tnodataval);
   nodataval=estr(tnodataval).f();
   
-  cout << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << " rowsperstrip: " << rowsperstrip << endl;
+  cerr << "xsize: " << xsize << " ysize: " << ysize << " spp: " << spp << " sf: " << sf << " depth: " << depth << " bps: " << bps << " rowsperstrip: " << rowsperstrip << endl;
 
   GTIFDefn defn;
   if (GTIFGetDefn(gtif, &defn)){
-    printf( "\n" );
-    GTIFPrintDefnEx( gtif, &defn, stdout );
+//    printf( "\n" );
+//    GTIFPrintDefnEx( gtif, &defn, stdout );
 
-    printf( "\n" );
-    printf( "PROJ.4 Definition: %s\n", GTIFGetProj4Defn(&defn));
+//    printf( "\n" );
+//    printf( "PROJ.4 Definition: %s\n", GTIFGetProj4Defn(&defn));
   }
 
 //  TIFFSetErrorHandler(TIFFError);
@@ -968,7 +1002,7 @@ int loadPopDens(const estr& fname){
 //	if (!TIFFReadRGBAImage(tif, xsize, ysize, raster, 0)) { lerror("reading TIFF data"); exit(-1); return(-1); }
 
 
-  printf( "\nCorner Coordinates:\n" );
+//  printf( "\nCorner Coordinates:\n" );
 
   unsigned short raster_type = RasterPixelIsArea;
   GTIFKeyGetSHORT(gtif, GTRasterTypeGeoKey, &raster_type, 0, 1);
@@ -991,10 +1025,10 @@ int loadPopDens(const estr& fname){
   GTIFImageToPCS( gtif, &c_ur_x, &c_ur_y );
   GTIFImageToPCS( gtif, &c_br_x, &c_br_y );
 
-  cout << "upper left: " << c_ul_x << " " << c_ul_y << endl;
-  cout << "upper right: " << c_ur_x << " " << c_ur_y << endl;
-  cout << "bottom left: " << c_bl_x << " " << c_bl_y << endl;
-  cout << "bottom right: " << c_br_x << " " << c_br_y << endl;
+  cerr << "upper left: " << c_ul_x << " " << c_ul_y << endl;
+  cerr << "upper right: " << c_ur_x << " " << c_ur_y << endl;
+  cerr << "bottom left: " << c_bl_x << " " << c_bl_y << endl;
+  cerr << "bottom right: " << c_br_x << " " << c_br_y << endl;
 
   uint32_t rxmin=0;
   uint32_t rxmax=0;
@@ -1003,29 +1037,29 @@ int loadPopDens(const estr& fname){
 
   double sX=psShape->dfXMin;
   double sY=psShape->dfYMin;
-  cout << "top left of shape: " << sX << " " << sY << endl;
+  cerr << "top left of shape: " << sX << " " << sY << endl;
   GTIFPCSToImage( gtif, &sX,&sY );
-  cout << "top left of shape: " << sX << " " << sY << endl;
+  cerr << "top left of shape: " << sX << " " << sY << endl;
 //  cout << "value: " << raster[uint32_t(sY)*xsize + uint32_t(sX)] << " nodataval: " << nodataval << endl;
   rxmin=sX;
   rymin=sY;
 
   sX=psShape->dfXMax;
   sY=psShape->dfYMax;
-  cout << "bottom right of shape: " << sX << " " << sY << endl;
+  cerr << "bottom right of shape: " << sX << " " << sY << endl;
   GTIFPCSToImage( gtif, &sX,&sY );
-  cout << "bottom right of shape: " << sX << " " << sY << endl;
+  cerr << "bottom right of shape: " << sX << " " << sY << endl;
 //  cout << "value: " << raster[uint32_t(sY)*xsize + uint32_t(sX)] << " nodataval: " << nodataval << endl;
   rxmax=sX;
   rymax=sY;
 
   if (rxmin>rxmax) swap(rxmin,rxmax);
   if (rymin>rymax) swap(rymin,rymax);
-  cout << "sxmin: " << rxmin << " sxmax: " << rxmax <<endl;
-  cout << "symin: " << rymin << " symax: " << rymax <<endl;
+  cerr << "sxmin: " << rxmin << " sxmax: " << rxmax <<endl;
+  cerr << "symin: " << rymin << " symax: " << rymax <<endl;
   rwidth=rxmax-rxmin;
   rheight=rymax-rymin;
-  cout << "rwidth: " << rwidth << " rheight: " << rheight <<endl;
+  cerr << "rwidth: " << rwidth << " rheight: " << rheight <<endl;
  
 	int npixels = rwidth * rheight;
 	float *raster = (float*) _TIFFmalloc(npixels * sizeof (float));
@@ -1095,7 +1129,7 @@ void adjustPopCounts(int popsize)
 
   surfacemask=cairo_image_surface_create_for_data(shapeMask,CAIRO_FORMAT_A8,rwidth,rheight,shapeRow);
   int cstatus=cairo_surface_status(surfacemask);
-  cout << "# stride A8 width: " << rwidth << " stride: " << cairo_format_stride_for_width (CAIRO_FORMAT_A8,rwidth) << endl;
+  cerr << "# stride A8 width: " << rwidth << " stride: " << cairo_format_stride_for_width (CAIRO_FORMAT_A8,rwidth) << endl;
   ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
   crmask=cairo_create(surfacemask); 
   cairoDrawShape(crmask,psShape,0.0,0.0,float(rwidth)/(psShape->dfXMax-psShape->dfXMin),false,rheight,true);
@@ -1124,13 +1158,13 @@ void adjustPopCounts(int popsize)
     if (popCounts[i]>rmaxpop) { imaxpop=i;  rmaxpop=popCounts[i]; }
     rpopsize+=popCounts[i];
   }
-  cout << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
-  cout << "rmaxpop: " << popCounts[imaxpop] << endl;
+  cerr << "rpopsize: " << rpopsize << " totalpopsize: " << totalpopsize << endl;
+  cerr << "rmaxpop: " << popCounts[imaxpop] << endl;
 
 
   
 
-  cout << "Adjusting raster population counts to: " << popsize << endl;
+  cerr << "Adjusting raster population counts to: " << popsize << endl;
   while (fabs(rpopsize-popsize)>0.01*popCounts[imaxpop]){
     // adjust population counts to match current country population census
     long numfrac=0;
@@ -1142,28 +1176,31 @@ void adjustPopCounts(int popsize)
 //    frac=(tmpf*double(popsize)/rpopsize+frac-floor(tmpf*double(popsize)/rpopsize+frac));
     }
 //  rmaxpop=rmaxpop*double(popsize)/rpopsize;
-    cout << "rpopsize: " << rpopsize << " " << double(rpopsize)/popsize << endl;
+    cerr << "rpopsize: " << rpopsize << " " << double(rpopsize)/popsize << endl;
 
     rpopsize=0;
     for (int i=0; i<popCounts.size(); ++i)
       rpopsize+=popCounts[i];
   }
-  cout << "rpopsize after initial adjustment: " << rpopsize << endl;
-  cout << "rmaxpop after initial adjustment: " << popCounts[imaxpop] << endl;
-  cout << "Final adjustment to grid with highest count:" << endl;
+  cerr << "rpopsize after initial adjustment: " << rpopsize << endl;
+  cerr << "rmaxpop after initial adjustment: " << popCounts[imaxpop] << endl;
+  cerr << "Final adjustment to grid with highest count:" << endl;
   popCounts[imaxpop]+=popsize-rpopsize;
   rmaxpop=popCounts[imaxpop];
-  cout << "adjusted rmaxpop: " << rmaxpop << endl;
+  cerr << "adjusted rmaxpop: " << rmaxpop << endl;
 
 
 //  exit(0);
 }
 
-void loadDBF(const estr& fname)
+void loadDBF(const estr& fname,const estrarray& selection,estrarrayof<int>& shplist)
 {
-  DBFHandle hDBF = DBFOpen( pszFilename, "rb" );
+  DBFHandle hDBF = DBFOpen( fname._str, "rb" );
+//  for (int i=0; i<selection.size(); ++i)   // this way does not allow for multiple matching
+//    shplist.add(selection.values(i),-1);
+
   if (hDBF == NULL ){
-    printf( "DBFOpen(%s,\"r\") failed.\n", argv[1] );
+    printf( "DBFOpen(%s,\"r\") failed.\n", fname._str );
     exit( 2 );
   }
     
@@ -1172,12 +1209,17 @@ void loadDBF(const estr& fname)
     exit( 3 );
   }
 
+  char szTitle[255],szFormat[255];
+
+  estrarray fieldNames;
+
   for (int i = 0; i < DBFGetFieldCount(hDBF); ++i){
     DBFFieldType	eType;
     const char	 	*pszTypeName;
     char chNativeType;
 
     chNativeType = DBFGetNativeFieldType( hDBF, i );
+    int nWidth,nDecimals;
 
     eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
     if( eType == FTString )
@@ -1188,24 +1230,83 @@ void loadDBF(const estr& fname)
         pszTypeName = "Double";
     else if( eType == FTInvalid )
         pszTypeName = "Invalid";
-
-    printf( "Field %d: Type=%c/%s, Title=`%s', Width=%d, Decimals=%d\n",
-            i, chNativeType, pszTypeName, szTitle, nWidth, nDecimals );
+    fieldNames.add(szTitle);
+//    printf( "Field %d: Type=%c/%s, Title=`%s', Width=%d, Decimals=%d\n",
+//            i, chNativeType, pszTypeName, szTitle, nWidth, nDecimals );
   }
+  cerr << "# shape dbf file fields: " << fieldNames << endl;
 
-  for( i = 0; i < DBFGetFieldCount(hDBF) && !bMultiLine; i++ ){
+/*
+  for( int i = 0; i < DBFGetFieldCount(hDBF); i++ ){
     DBFFieldType	eType;
+    int nWidth,nDecimals;
 
     eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
   }
   printf( "\n" );
+*/
 
-  for ( iRecord = 0; iRecord < DBFGetRecordCount(hDBF); iRecord++ ) {
-    for ( i = 0; i < DBFGetFieldCount(hDBF); i++ ){
+  estrarrayof<evar> valarr;
+
+  bool is_hit;
+  for ( int iRecord = 0; iRecord < DBFGetRecordCount(hDBF); iRecord++ ) {
+    valarr.clear();
+    for ( int i = 0; i < DBFGetFieldCount(hDBF); i++ ){
       DBFFieldType eType;
+      int nWidth,nDecimals;
             
       eType = DBFGetFieldInfo( hDBF, i, szTitle, &nWidth, &nDecimals );
 
+      if( DBFIsAttributeNULL( hDBF, iRecord, i ) ) {
+        valarr.add(szTitle,evar());
+      } else {
+        switch( eType ){
+          case FTString:
+            valarr.add(szTitle,DBFReadStringAttribute( hDBF, iRecord, i ));
+            break;
+          case FTInteger:
+            valarr.add(szTitle,DBFReadIntegerAttribute( hDBF, iRecord, i ));
+            break;
+          case FTDouble:
+            valarr.add(szTitle,DBFReadDoubleAttribute( hDBF, iRecord, i ));
+            break;
+          default:
+            break;
+        }
+      }
+/*
+      if (selection.findkey(szTitle)==-1) continue; // skip fields not in selection list
+      if( !DBFIsAttributeNULL( hDBF, iRecord, i ) && eType==FTString) {
+        const char *fvalue=DBFReadStringAttribute( hDBF, iRecord, i );
+        int iv=selection.find(fvalue);
+        if (iv!=-1){
+          is_hit=true;
+          shplist.add(fvalue,iRecord);
+//          sprintf( szFormat, "%i %%-%ds\n", iRecord, nWidth );
+//          printf( szFormat, fvalue );
+        }
+      }
+*/
+    }
+    bool is_hit=false,is_excluded=false;
+    for (int j=0; j<selection.size(); ++j){
+      estr fname=selection.keys(j);
+      bool exclude=false;
+      if (selection.keys(j)[0]=='!'){
+        exclude=true;
+        fname=selection.keys(j).substr(1);
+      }
+      if (valarr[fname]==selection.values(j)){
+        if (!exclude) is_hit=true;
+        else is_excluded=true;
+      }
+    }
+    if (is_hit && !is_excluded){
+      shplist.add(iRecord);
+      cerr << valarr << endl;
+    }
+  }
+/*
       if( DBFIsAttributeNULL( hDBF, iRecord, i ) ) {
         if( eType == FTString )
           sprintf( szFormat, "%%-%ds", nWidth );
@@ -1237,15 +1338,19 @@ void loadDBF(const estr& fname)
             break;
         }
       }
-    }
-  }
-
+      printf("  ");
+*/
 
   DBFClose( hDBF );
 }
 
+void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-1000.0){
 
-void loadShape(const estr& fname,double lonLimit=-1000.0){
+  estrarrayof<int> shplist;
+  loadDBF(fname.substr(0,-5)+".dbf",selection,shplist);
+  exit(0);
+
+
   SHPHandle hSHP;
   int nShapeType, nEntities;
   double adfMinBound[4],adfMaxBound[4];
@@ -1254,9 +1359,10 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
   SHPGetInfo( hSHP, &nEntities, &nShapeType, adfMinBound, adfMaxBound );
 
   int nPrecision = 15;
-  printf( "Shapefile Type: %s   # of Shapes: %d\n\n",
-            SHPTypeName( nShapeType ), nEntities );
+//  printf( "Shapefile Type: %s   # of Shapes: %d\n\n",
+//            SHPTypeName( nShapeType ), nEntities );
     
+/*
   printf( "File Bounds: (%.*g,%.*g,%.*g,%.*g)\n"
             "         to  (%.*g,%.*g,%.*g,%.*g)\n",
             nPrecision, adfMinBound[0], 
@@ -1267,6 +1373,7 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
             nPrecision, adfMaxBound[1], 
             nPrecision, adfMaxBound[2], 
             nPrecision, adfMaxBound[3] ); 
+*/
 
   ldieif(nEntities>1,"more than one shape entity found");
 
@@ -1282,7 +1389,7 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
                     0 );
 //      break;
     }else{
-
+/*
       printf( "\nShape:%d (%s)  nVertices=%d, nParts=%d\n"
                   "  Bounds:(%.*g,%.*g, %.*g)\n"
                   "      to (%.*g,%.*g, %.*g)\n",
@@ -1294,6 +1401,7 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
                     nPrecision, psShape->dfXMax,
                     nPrecision, psShape->dfYMax,
                     nPrecision, psShape->dfZMax ); 
+*/
     }
 //    SHPDestroyObject(psShape);
 //  }
@@ -1324,8 +1432,8 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
     newParts[newParts.size()-1]=tj;
   }
   if (lonLimit>-1000.0){
-    for (int i=0; i<psShape->nParts; ++i)
-      cout << "i: "<< i << " " << psShape->panPartStart[i] << endl;
+//    for (int i=0; i<psShape->nParts; ++i)
+//      cout << "i: "<< i << " " << psShape->panPartStart[i] << endl;
     psShape->nParts=1;
     for (int i=1,ti=1; i<newParts.size(); ++i){
       if (newParts[i]>newParts[i-1]){
@@ -1334,10 +1442,11 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
         ++psShape->nParts;
       }
     }
-    for (int i=0; i<psShape->nParts; ++i)
-      cout << "i: "<< i << " " << psShape->panPartStart[i] << endl;
-    cout << "Reduced shape with lonLimit: " << psShape->nVertices << " to " << tj << endl;
+//    for (int i=0; i<psShape->nParts; ++i)
+//      cerr << "i: "<< i << " " << psShape->panPartStart[i] << endl;
+    cerr << "Reduced shape with lonLimit: " << psShape->nVertices << " to " << tj << endl;
     psShape->nVertices=tj;
+/*
       printf( "\nNew Shape:%d (%s)  nVertices=%d, nParts=%d\n"
                   "  Bounds:(%.*g,%.*g, %.*g)\n"
                   "      to (%.*g,%.*g, %.*g)\n",
@@ -1349,6 +1458,7 @@ void loadShape(const estr& fname,double lonLimit=-1000.0){
                     nPrecision, psShape->dfXMax,
                     nPrecision, psShape->dfYMax,
                     nPrecision, psShape->dfZMax ); 
+*/
   }
     
 
@@ -1506,26 +1616,29 @@ void threadSeedInfections(ssimstate& st,sthreadState& ths,int i,int n)
 {
 //  if (st.seedGrid < st.spGrid.size()*i/n || st.seedGrid >= st.spGrid.size()*(i+1)/n) return;
   st.mutex.lock();
-  cout << "i: " << i << " n: " << n << " " << st.spGrid.size()*i/n << " " << st.spGrid.size()*(i+1)/n << " " << st.spGrid.size() << endl;
+//  cerr << "i: " << i << " n: " << n << " " << st.spGrid.size()*i/n << " " << st.spGrid.size()*(i+1)/n << " " << st.spGrid.size() << endl;
   st.mutex.unlock();
 
 
-  bool found=false;
+  eintarray seedlist;
   for (int ti=st.spGrid.size()*i/n; ti<st.spGrid.size()*(i+1)/n && ti<st.spGrid.size(); ++ti){
     int gi=st.gridShuffle[ti];
-    if (st.seedGrid==gi){ found=true; break; }
+    int ik=st.iseedArr.findkey(gi);
+    if (ik!=-1) seedlist.add(ik);
   }
-  if (!found) return;
+  if (seedlist.size()==0) return;
 
-  cout << "# seeding initial infected: " << st.fseed << endl;
+//  cerr << "# seeding initial infected: " << st.fseed << endl;
 
   // seed infections
   edoublearray mp;
   euintarray counts;
 
-  counts.init(3,0);
-  counts[1]=st.fseed;
-  ths.evqueue.add(st,ths,st.seedGrid,0,2,0,counts,st.dE,ths.r);  // add Exposed to grid position with highest population count
+  for (int i=0; i<seedlist.size(); ++i){
+    counts.init(3,0);
+    counts[1]=st.iseedArr.values(seedlist[i]);
+    ths.evqueue.add(st,ths,st.iseedArr.keys(seedlist[i]),0,2,0,counts,st.dE,ths.r);
+  }
 }
 
 void threadRun(ssimstate &st)
@@ -1552,7 +1665,7 @@ void threadRun(ssimstate &st)
       st.allE+=ths.allE;
       ths.allE=0;
       st.allICU+=ths.allICU; ths.allICU=0;
-      st.allNonICU+ths.allNonICU; ths.allNonICU=0;
+      st.allNonICU+=ths.allNonICU; ths.allNonICU=0;
       st.allD+=ths.allD; ths.allD=0;
       for (int i=0; i<ngroups; ++i){
         st.Ip[i]+=ths.Ip[i];
@@ -1576,6 +1689,33 @@ void threadRun(ssimstate &st)
   } while(threadFunc);
 }
 
+void actionDaemon()
+{
+}
+
+estr sfile;
+
+void bgThreadRun()
+{
+  startDaemon(sfile);
+  getSystem().run();
+}
+
+int findPopGrid(ssimstate& st,double lat,double lon,int seedcount){
+//  int seedGrid=getGrid(46.0,8.95);
+  int seedGrid=getGrid(lat,lon);
+//  if (st.seedGrid==-1) { cerr << "# coordinate not found chosing most populated area" << endl; st.seedGrid=imaxpop; }
+  if (st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<seedcount){
+//    cerr << "igrid: " << st.seedGrid << " levels empty, looking for another grid pos" << endl;
+    int ix=seedGrid%st.spGridW;
+    int ih=seedGrid/st.spGridW;
+    for (int ti=0;ix<st.spGridW && ti<10 && st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<seedcount; ++ix,++seedGrid,++ti);
+    cerr << "seedGrid: " << seedGrid << " " << st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
+//    if (ix==st.spGridW) { cerr << "did not find any populated areas close to choice" << endl; seedGrid=imaxpop; }
+    if (ix==st.spGridW || st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<seedcount) { cerr << "did not find any populated areas close to choice" << endl; seedGrid=-1; }
+  }
+  return(seedGrid);
+}
 
 
 int emain()
@@ -1583,12 +1723,16 @@ int emain()
   ssimstate st;
   epregister2(st.R0,"r0");
 
+  int agethres=50;
+  epregister(agethres);
+
 //  int avgage=0; // take most age of first individual (usually the oldest), or the avg age of the household for the household age group
 //  epregister(avgage);
 
 //  double finter=1.0;
 //  double fintra=1.0;
 
+/*
   double foldr=1.0; // isolation for households with older members
   int tostart=-1; // start isolation
   int toend=-1; // end isolation
@@ -1602,6 +1746,7 @@ int emain()
   epregister(fmr);
   epregister(tmstart);
   epregister(tmend);
+*/
 
   double tmax=300.0;
   epregister(tmax);
@@ -1616,7 +1761,10 @@ int emain()
   estr fshape="data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp";
   epregister(fshape);
 //  int fseed=10;
-  epregister2(st.fseed,"fseed");
+//  epregister2(st.fseed,"fseed");
+
+  estrarray iseed;
+  epregister(iseed);
 
 
 //  int nthreads=4;
@@ -1628,6 +1776,9 @@ int emain()
   estrarray events;
   epregister(events);
 
+  estrarray oevents;
+  epregister(oevents);
+
   double lonLimit=-1000.0;
   epregister(lonLimit);
 
@@ -1636,18 +1787,56 @@ int emain()
   double flargehh=0.0;
   epregister(flargehh);
 
+//  bool icucontrol=false;
+//  epregister(icucontrol);
+
+  int casestrigger=-1;
+  epregister(casestrigger);
+
+  double rthres=0.99;
+  double rthres2=0.95;
+  epregister(rthres);
+  epregister(rthres2);
+
+
+  int iculimit=-1;
+  epregister(iculimit);
+
+  double ftrigger=1.0;
+  epregister(ftrigger);
+
+//  daemonArgs(actionDaemon);
+  epregister(sfile);
+  int it;
+  epregister(it);
+
+  estrarray shpsel;
+  epregister(shpsel);
 
   eparseArgs();
+
+  ethreadFunc bgThread;
+  if (sfile.len())
+    bgThread.run(bgThreadRun);
 
 
   estrarray tmparr;
   earrayof<double,int> eventsArr;
   for (int i=0; i<events.size(); ++i){
     tmparr=events[i].explode(":");
+    ldieif(tmparr.size()<2,"wrong format for event: <day>:<isolationfactor>,<day2>:<isolationfactor2>,...");
     eventsArr.add(tmparr[0].i(),tmparr[1].f());
   }
 
-  cout << "# R0: " << st.R0 << endl;
+  earrayof<double,int> oeventsArr;
+  for (int i=0; i<oevents.size(); ++i){
+    tmparr=oevents[i].explode(":");
+    ldieif(tmparr.size()<2,"wrong format for event: <day>:<isolationfactor>,<day2>:<isolationfactor2>,...");
+    oeventsArr.add(tmparr[0].i(),tmparr[1].f());
+  }
+
+
+  cerr << "# R0: " << st.R0 << endl;
 
   eintarray agegroups;
 
@@ -1671,9 +1860,12 @@ int emain()
   for (int i=0; i<agegroups.size(); ++i)
     popsize+=agegroups[i];
 
-  cout << "# total population: " << popsize << endl;
+  cerr << "# total population: " << popsize << endl;
 
-  loadShape(fshape,lonLimit);
+  cerr << "# shpsel: " << shpsel << endl;
+
+  loadShape(fshape,shpsel,lonLimit);
+  exit(0);
 //  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
 
   loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif"); // loads population counts raster data
@@ -1716,7 +1908,7 @@ int emain()
   householdSizeDist[1]+=popsize-total_hh_individuals; // Add missing individuals as single house holds
   total_households += popsize-total_hh_individuals;
 
-  cout << "# hh individuals: " << total_hh_individuals << "    " << popsize << endl;
+  cerr << "# hh individuals: " << total_hh_individuals << "    " << popsize << endl;
   
 
   etable agegroup_infparams(etableLoad("data/agegroup.infparams",options));
@@ -1735,7 +1927,7 @@ int emain()
   for (int i=0; i<agegroups.size(); ++i){
     tmpcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
     tmpdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i]);
-    cout << "# age: " << 5*i << " critical: " << tmpcritical << " (" << tmpcritical/totcritical << ")" << " deaths: " << tmpdeaths << " (" << tmpdeaths/totdeaths << ")" <<endl;
+    cerr << "# age: " << 5*i << " critical: " << tmpcritical << " (" << tmpcritical/totcritical << ")" << " deaths: " << tmpdeaths << " (" << tmpdeaths/totdeaths << ")" <<endl;
   }
 
 
@@ -1772,7 +1964,7 @@ int emain()
   st.hhLevels2.init(total_households);
   ldieif(householdSizeDist.size()!=maxhousesize,"household size dist must be the same as maxhouse size");
 
-  cout << "# total households: " << total_households << endl;
+  cerr << "# total households: " << total_households << endl;
   st.households.init(total_households);
 
 
@@ -1808,19 +2000,19 @@ int emain()
   st.pop_ages.init(popsize,0);
 
   
-  cout << householdSizeDist << endl;
+  cerr << householdSizeDist << endl;
 
   int assigned=0;
   const int agegroupband=5; // years
   eintarray tmpag(agegroups);
-  cout << tmpag << endl;
+  cerr << tmpag << endl;
 
   // TODO: make gaussian distributed ages, this would take care of imperfect matches
   // TODO: make this step a setup step requiring a different option to run that generates the household structure file.
   for (int i=householdSizeDist.size()-1; i>=1; --i){
-    cout << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
+    cerr << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
     if (i==1)
-      cout << tmpag << endl;
+      cerr << tmpag << endl;
     for (int j=0; j<hhlist[i].size(); ++j){
       shousehold &sh(st.households[hhlist[i][j]]);
       do {
@@ -1837,7 +2029,7 @@ int emain()
 
       // age group of "oldest" person in house
       sh.hage=st.pop_ages[sh.ageind];
-      sh.group=(sh.hage>=10?1:0); // set to 1 or 0 depending on age
+      sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
 
       if (i>1){
         do {
@@ -1873,13 +2065,13 @@ int emain()
       }
     }
   }
-  cout << "# done populating households: " << assigned << endl;
+  cerr << "# done populating households: " << assigned << endl;
 
 
   st.spGridW=rwidth;
   st.spGridH=rheight;
   st.spGridSize=st.spGridW*st.spGridH;
-  cout << "# initializing spatial grid: " << st.spGridW << "x" << st.spGridH << endl;
+  cerr << "# initializing spatial grid: " << st.spGridW << "x" << st.spGridH << endl;
   st.spGrid.init(st.spGridSize); // init 100 x 100 grid
   for (int i=0; i<st.spGrid.size(); ++i){
     for (int pg=0; pg<ngroups; ++pg){
@@ -1916,8 +2108,8 @@ int emain()
     int gpop=popCounts[i];
     if (gpop==0) continue;
 
-    if (popsize-gpopAll<10000) { cout << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << "  gpop: " << gpop << endl; }
-    if (gpop > popsize-gpopAll) { cout << "more individuals needed than available: " << gpop << " " << popsize-gpopAll << " gpos: " << i << " gsize: " << st.spGrid.size() << endl; /*exit(-1);*/ break; }
+    if (popsize-gpopAll<10000) { cerr << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << "  gpop: " << gpop << endl; }
+    if (gpop > popsize-gpopAll) { cerr << "more individuals needed than available: " << gpop << " " << popsize-gpopAll << " gpos: " << i << " gsize: " << st.spGrid.size() << endl; /*exit(-1);*/ break; }
     int hhcount=samplehh(hhids,st.households,gpop,rnd); // find a random set of hh that sum to popsize in the grid and put it at the end of hhids
     for (int l=0; l<hhcount; ++l){
       shousehold &hh(st.households[hhids[hhids.size()-1]]);
@@ -1999,7 +2191,7 @@ int emain()
   }
 */
 
-  cout << "# initializing levels" << endl;
+  cerr << "# initializing levels" << endl;
 
 
   int hhOlder=0;
@@ -2028,7 +2220,7 @@ int emain()
   st.grow=ngroups*householdSizeDist.size()*nlevels;
   st.arow=householdSizeDist.size()*nlevels;
 
-  cout << "# initializing levels indices" << endl;
+  cerr << "# initializing levels indices" << endl;
   // initializes the start of each hhLevel subarray inside the large single array using the number of households per segment
   for (int gi=0,ipos=0; gi<st.spGrid.size(); ++gi){
     for (int hg=0; hg<ngroups; ++hg){
@@ -2049,7 +2241,7 @@ int emain()
     }
   }
 
-  cout << "# populating levels indices" << endl;
+  cerr << "# populating levels indices" << endl;
   // populate hhLevels
   for (int i=0; i<st.households.size(); ++i){
     shousehold &sh(st.households[i]);
@@ -2066,14 +2258,14 @@ int emain()
       ++hhOlder;
       hhOlderN+=sh.size;
       for (int l=0; l<sh.size; ++l){
-        if (agearr[l]>=10)
+        if (agearr[l]>=agethres/5)
           ++hhOlderNO;
         else
           ++hhOlderNY;
       }
     }else{
       for (int l=0; l<sh.size; ++l){
-        if (agearr[l]>=10)
+        if (agearr[l]>=agethres/5)
           ++hhYoungNO;
         else
           ++hhYoungNY;
@@ -2082,12 +2274,12 @@ int emain()
   }
 
 
-  cout << "# hhOlder: " << hhOlder << " (" << double(hhOlder)/total_households << ")" << endl;
-  cout << "# hhOlderN: " << hhOlderN << " (" << double(hhOlderN)/popsize << ")" << endl;
-  cout << "# hhOlderNO: " << hhOlderNO << " (" << double(hhOlderNO)/popsize << ")" << endl;
-  cout << "# hhOlderNY: " << hhOlderNY << " (" << double(hhOlderNY)/popsize << ")" << endl;
-  cout << "# hhYoungNO: " << hhYoungNO << " (" << double(hhYoungNO)/popsize << ")" << endl;
-  cout << "# hhYoungNY: " << hhYoungNY << " (" << double(hhYoungNY)/popsize << ")" << endl;
+  cerr << "# hhOlder: " << hhOlder << " (" << double(hhOlder)/total_households << ")" << endl;
+  cerr << "# hhOlderN: " << hhOlderN << " (" << double(hhOlderN)/popsize << ")" << endl;
+  cerr << "# hhOlderNO: " << hhOlderNO << " (" << double(hhOlderNO)/popsize << ")" << endl;
+  cerr << "# hhOlderNY: " << hhOlderNY << " (" << double(hhOlderNY)/popsize << ")" << endl;
+  cerr << "# hhYoungNO: " << hhYoungNO << " (" << double(hhYoungNO)/popsize << ")" << endl;
+  cerr << "# hhYoungNY: " << hhYoungNY << " (" << double(hhYoungNY)/popsize << ")" << endl;
 
 
 
@@ -2122,16 +2314,19 @@ int emain()
 //  st.evqueue.add(st,6,2,0,counts,st.dIp,rnd,2); 
 //  st.allE=fseed;
 //  cout << "hhLevelsBegin: " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2+1] << " " << st.hhLevelsBegin[1010*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
+
+/*
   st.seedGrid=getGrid(46.0,8.95);
-  if (st.seedGrid==-1) { cout << "# coordinate not found chosing most populated area" << endl; st.seedGrid=imaxpop; }
+  if (st.seedGrid==-1) { cerr << "# coordinate not found chosing most populated area" << endl; st.seedGrid=imaxpop; }
   else if (st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<st.fseed){
-    cout << "igrid: " << st.seedGrid << " levels empty, looking for another grid pos" << endl;
+    cerr << "igrid: " << st.seedGrid << " levels empty, looking for another grid pos" << endl;
     int ix=st.seedGrid%st.spGridW;
     int ih=st.seedGrid/st.spGridW;
     for ( ;ix<st.spGridW && st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2]<st.fseed; ++ix,++st.seedGrid);
-    cout << "seedGrid: " << st.seedGrid << " " << st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
-    if (ix==st.spGridW) { cout << "did not find any populated areas close to choice" << endl; st.seedGrid=imaxpop; }
+    cerr << "seedGrid: " << st.seedGrid << " " << st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+3]-st.hhLevelsBegin[st.seedGrid*st.grow + 0*st.arow + 2*(2+1)/2+2] << endl;
+    if (ix==st.spGridW) { cerr << "did not find any populated areas close to choice" << endl; st.seedGrid=imaxpop; }
   }
+*/
 //  st.evqueue.add(st,igrid,0,2,0,counts,st.dE,rnd);  // add Exposed to grid position with highest population count
 
   st.gridShuffle.init(st.spGrid.size());
@@ -2140,7 +2335,7 @@ int emain()
   permute(st.gridShuffle,0,st.gridShuffle.size(),rnd);
 
 
-  cout << "# starting simulation" << endl;
+  cerr << "# starting simulation" << endl;
 
   double tpeak=0.0;
   double peakIs=0.0;
@@ -2148,7 +2343,7 @@ int emain()
   double peakNonICU=0.0;
 
 //  ldieif(videoOpen(1024,768,5,1000)!=0,"error creating video file");
-  ldieif(videoOpen(1024,768,3,500)!=0,"error creating video file");
+  ldieif(videoOpen(1024,768,3,2000)!=0,"error creating video file");
 
 //  edoublearray localIprob;
 //  edoublearray localIprobGaussian;
@@ -2192,7 +2387,7 @@ int emain()
   st.localIprob.init(st.spGrid.size());
 
 
-  cout << "Time" << "\t" << "fE" << "\t" << "allE" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
+  cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
 
   ethreads t;
 
@@ -2208,7 +2403,28 @@ int emain()
   st.mutex.lock();
   while (st.threadDone>0) st.doneSignal.wait(st.mutex);
   st.mutex.unlock();
-  cout << "#starting simulation" << endl;
+  cerr << "#starting simulation" << endl;
+
+
+
+  // setup seed array
+  for (int i=0; i<iseed.size(); ++i){
+    tmparr=iseed[i].explode(":");
+    ldieif(tmparr.size()!=1 && tmparr.size()!=3,"wrong format for iseed: <lat>:<lon>:<infected>,<lat2>:<lon2>:<infected2>,...  or <infected>");
+    if (tmparr.size()==3){
+      int count=tmparr[2].i();
+      int igrid=findPopGrid(st,tmparr[0].f(),tmparr[1].f(),count);
+      if (igrid>=0){
+        cerr << "# seeding position: " << iseed[i] << endl;
+        st.iseedArr.add(igrid,count);
+      }
+    }else{
+      cerr << "# seeding most populated area with: " << iseed[i] << endl;
+      st.iseedArr.add(imaxpop,tmparr[0].i());
+    }
+  }
+
+
 
 
   st.mutex.lock();
@@ -2220,39 +2436,27 @@ int emain()
   st.mutex.unlock();
 
 
-  int lastCases=0;
 
-  for (int it=0; it*st.tstep<tmax; ++it){
-    if (it%4==0){
-      renderFrame(it*st.tstep,st.smr,st.allCases-lastCases,frameraw,st,vwidth,vheight);
-      lastCases=st.allCases;
-    }
-    while (eventsArr.size()>0 && eventsArr.keys(0) <= it*st.tstep){
-      st.smr=eventsArr.values(0);
-      eventsArr.erase(0);
-    }
+  time_t rawtime;
+  time(&rawtime);
+  tm *timeinfo = localtime(&rawtime);
+  timeinfo->tm_year=2020;
+  timeinfo->tm_mon=0;
+  timeinfo->tm_mday=20;
+  mktime(timeinfo);
+  
 
-    if (tmstart>=0 && it*st.tstep >= tmstart){
-      st.smr=fmr;
-      tmstart=-1;
-    }
+  int lastCases=0,lastCases2=0;
+  int newCases=0;
+  int newICU=0,lastICU=0,lastICU2=0;
+  char tmpsz[255];
+  double Reff=1.0;
 
-    if (tmend>0 && it*st.tstep >= tmend){
-      st.smr=1.0;
-      tmend=-1;
-    }
+  double tmpicusmr=-1.0;
 
-    if (tostart>=0 && it*st.tstep >= tostart){
-      st.soldr=foldr;
-      tostart=-1;
-    }
+  for (it=0; it*st.tstep<tmax; ++it){
+    fE=double(st.allE)/popsize;
 
-    if (toend>0 && it*st.tstep >= toend){
-      st.soldr=1.0;
-      toend=-1;
-    }
-
-//    double interhhrate=(hage>=10?folder:1.0)*finter*st.R0*(1.0-fE)*(0.5*st.allIa+st.allIp+st.allIs)/(popsize-st.allE);
     if (peakIs < st.Is[0]+st.Is[1]){
       peakIs=st.Is[0]+st.Is[1];
       tpeak=it*st.tstep;
@@ -2261,6 +2465,53 @@ int emain()
       peakICU=st.allICU;
     if (peakNonICU < st.allNonICU)
       peakNonICU=st.allNonICU;
+
+    while (eventsArr.size()>0 && eventsArr.keys(0) <= it*st.tstep){
+      st.smr=eventsArr.values(0);
+      eventsArr.erase(0);
+    }
+    while (oeventsArr.size()>0 && oeventsArr.keys(0) <= it*st.tstep){
+      st.soldr=oeventsArr.values(0);
+      oeventsArr.erase(0);
+    }
+
+    if (it%4==0){
+      strftime(tmpsz,255,"%a %d %b",timeinfo);
+      newCases=st.allCases-lastCases;
+      newICU=st.allICU-lastICU;
+//      newDeltaICU=newICU/lastNewICU;
+      
+//      Reff=(lastCases==lastCases2?1.0:5.0*double((st.allCases-lastCases))/(lastCases-lastCases2)); 
+      Reff=Reff*2.0/3.0+((lastCases==lastCases2?1.0:pow(double(st.allCases-lastCases)/(lastCases-lastCases2),5.0))/3.0); 
+//      cout << "st.allCases: " << st.allCases << " lastCases: " << lastCases << " lastCases2: " << lastCases2 << endl;
+//      Reff=(st.allCases-lastCases)/(lastCases-lastCases2); 
+      renderFrame(tmpsz,st.smr,newCases,frameraw,st,vwidth,vheight);
+      lastCases2=lastCases;
+      lastCases=st.allCases;
+      lastICU2=lastICU;
+      lastICU=st.allICU;
+//      rawtime+=60*60*24; // number of seconds per day
+      ++timeinfo->tm_mday;
+      mktime(timeinfo);
+//      if (tmpicusmr<0.0 && st.allICU+18*newICU+18*(18+1)*newDeltaICU/2>iculimit){
+      if (iculimit>=0 && Reff<rthres2 && st.allICU<0.8*iculimit && tmpicusmr>=0.0){
+        st.smr=tmpicusmr;
+        tmpicusmr=-1.0;
+        cerr << "# low ICU remove icu limit: " << " " << st.smr << endl;
+      } else if (iculimit>=0 && Reff<rthres && st.allICU<0.9*iculimit && tmpicusmr>=0.0){
+        st.smr=0.5*ftrigger;
+        cerr << "# Reducing isolation: " << " " << st.smr << endl;
+      } else if (casestrigger>=0.0 && newCases>casestrigger && fE<0.2){
+        if (tmpicusmr<0.0){
+          tmpicusmr=st.smr;
+//          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
+          st.smr=0.3*ftrigger;
+          cerr << "# ICU capacity triggered icu limit: " << st.allICU*exp(5*log(Reff)) << " " << st.smr << endl;
+        }
+      }
+    }
+
+//    double interhhrate=(hage>=10?folder:1.0)*finter*st.R0*(1.0-fE)*(0.5*st.allIa+st.allIp+st.allIs)/(popsize-st.allE);
 
     // The hhOlderN term is needed to prevent R0 from decreasing when older population is isolated from younger population
     // Whithout including this term, the simulation is equivalent to an older population considered immune but still interacting, thus reducing incorrectly the R0
@@ -2277,8 +2528,6 @@ int emain()
     // guarantee a reduction in 50% probability of getting infected. This however implies there is a saturation of the probability of infection, 
     // To put this more mechanistically: if we assume isolation reduces the time a person spends with other contacts or number of contacts (with constant time per contact), and we assume the probability of infection is proportional to the time exposed to an infected individual. Then isolation will always have an effect on probability of infection.
     // There are cases when this is not true, if the probability of infection is so high that it is enough to have a single contact even of very short duration to have a probability of 100% of getting infected and the proportion of infected is high enough to guarantee there is one infected person in almost every group of contacts, then reducing contact (either by decreasing the time or by decreasing the number of contacts) should correctly result in no reduced probability of infection, up to a certain point.
-
-    fE=double(st.allE)/popsize;
 
     st.mutex.lock();
     st.threadFunc=threadLocalInfection; // update events 
@@ -2379,13 +2628,13 @@ int emain()
     processEvents(st,nextEvents,rnd);
 */
 
-    cout << it*st.tstep << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
+    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 //    if (st.Ia[0]+st.Ia[1]+st.Is[0]+st.Is[1]+st.Ip[0]+st.Ip[1]==0) break;
   }
   videoClose();
-  cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
+//  cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 
-  cout << "# fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << endl;
+  cerr << "# fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << endl;
 
   st.mutex.lock();
   st.threadI=st.nthreads;

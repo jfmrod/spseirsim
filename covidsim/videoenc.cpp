@@ -13,6 +13,9 @@ extern "C" {
 
 AVFrame *videoFrame = nullptr;
 AVFrame *audioFrame = nullptr;
+
+AVStream *stream = nullptr;
+
 AVCodecContext *cctx = nullptr;
 SwsContext *swsCtx = nullptr;
 AVCodecContext *acctx = nullptr;
@@ -86,8 +89,11 @@ void videoPushFrame(uint8_t *data){
 
   // From RGB to YUV
   sws_scale(swsCtx, (const uint8_t * const *)&data, inLinesize, 0, cctx->height, videoFrame->data, videoFrame->linesize);
-  videoFrame->pts = (1.0/fps)*90000.0*(frameCounter++);
-//  std::cout << videoFrame->pts <<" " << cctx->time_base.num << " " << cctx->time_base.den << " " << frameCounter<< std::endl;
+//  videoFrame->pts = (1.0/fps)*90000.0*(frameCounter++);
+  videoFrame->pts = av_rescale_q((frameCounter++), cctx->time_base, stream->time_base);
+
+//  videoFrame->pts = frameCounter++;
+//  std::cout << videoFrame->pts <<" " << cctx->time_base.num << " " << cctx->time_base.den << " " << stream->time_base.num << " " << stream->time_base.den << " " << frameCounter<< std::endl;
   if ((err = avcodec_send_frame(cctx, videoFrame)) < 0) {
     std::cout << "Failed to send frame" << err <<std::endl;
     return;
@@ -101,11 +107,11 @@ void videoPushFrame(uint8_t *data){
   pkt.flags |= AV_PKT_FLAG_KEY;
   if (avcodec_receive_packet(cctx, &pkt) == 0) {
     static int counter = 0;
-    if (counter == 0){
-      FILE *fp = fopen("dump_first_frame1.dat", "wb");
-      fwrite(pkt.data, pkt.size,1,fp);
-      fclose(fp);
-    }
+//    if (counter == 0){
+//      FILE *fp = fopen("dump_first_frame1.dat", "wb");
+//      fwrite(pkt.data, pkt.size,1,fp);
+//      fclose(fp);
+//    }
 //    std::cout << "pkt key: " << (pkt.flags & AV_PKT_FLAG_KEY) <<" " << pkt.size << " " << (counter++) << std::endl;
     uint8_t *size = ((uint8_t*)pkt.data);
 //    std::cout << "first: " << (int)size[0] << " " << (int)size[1] << " " << (int)size[2] << " " << (int)size[3] <<" "  << (int)size[4] << " " << (int)size[5] << " " << (int)size[6] << " " << (int)size[7] << std::endl;
@@ -181,7 +187,7 @@ int videoOpen(int width,int height,int _fps,int bitrate)
     return -1;
   }
 
-  AVStream *stream = avformat_new_stream(ofctx, codec);
+  stream = avformat_new_stream(ofctx, codec);
   if (!stream) {
     std::cout << "can't find format" << std::endl;
     return -1;
@@ -200,18 +206,19 @@ int videoOpen(int width,int height,int _fps,int bitrate)
 //  stream->codecpar->aspect_ratio = {width,height};
   stream->codecpar->format = AV_PIX_FMT_YUV420P;
   stream->codecpar->bit_rate = bitrate * 1000;
+  stream->avg_frame_rate = (AVRational){fps, 1};
   avcodec_parameters_to_context(cctx, stream->codecpar);
 //  cctx->time_base = (AVRational){ 1, 1 };
 //  cctx->time_base = (AVRational){ 1, fps };
 
   cctx->width = width;
   cctx->height = height;
-//  cctx->aspect_ratio = {width,height};
-  cctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
+  cctx->qmin = 10;   // qmin=10
+  cctx->qmax = 51;   // qmax=51
 
   cctx->pix_fmt = AV_PIX_FMT_YUV420P;
-  cctx->time_base = (AVRational){ 1000, 1 };
+  cctx->time_base = (AVRational){ 1, fps };
   cctx->max_b_frames = 0;
 //  cctx->max_b_frames = 2;
   cctx->gop_size = 12;
@@ -242,7 +249,11 @@ int videoOpen(int width,int height,int _fps,int bitrate)
 //  cctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
 //  cctx->level=30;
-  cctx->level=32;
+  cctx->level=31;
+
+  avcodec_parameters_from_context(stream->codecpar, cctx);
+  av_opt_set(cctx->priv_data, "nal_length_size", "4", AV_OPT_SEARCH_CHILDREN);
+  av_opt_set(cctx->priv_data, "is_avc", "1", AV_OPT_SEARCH_CHILDREN);
   av_opt_set(cctx->priv_data, "profile", "baseline", AV_OPT_SEARCH_CHILDREN);
 
 /*
@@ -251,10 +262,9 @@ int videoOpen(int width,int height,int _fps,int bitrate)
   else if (stream->codecpar->codec_id == AV_CODEC_ID_H265)
     av_opt_set(cctx, "preset", "ultrafast", 0);
 */
-//  if (oformat->flags & AVFMT_GLOBALHEADER)
-//    cctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
+  if (oformat->flags & AVFMT_GLOBALHEADER)
+    cctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
 
-  avcodec_parameters_from_context(stream->codecpar, cctx);
   if ((err = avcodec_open2(cctx, codec, NULL)) < 0) {
     std::cout << "Failed to open codec" << err << std::endl;
     return -1;
@@ -314,7 +324,13 @@ int videoOpen(int width,int height,int _fps,int bitrate)
 
   AVDictionary *fmtOptions = nullptr;
   av_dict_set(&fmtOptions, "movflags", "faststart", 0);
-  av_dict_set(&fmtOptions, "brand", "mp42", 0);
+//  av_dict_set(&fmtOptions, "brand", "mp42", 0);
+
+  if (!stream->codecpar->extradata && cctx->extradata) {
+    stream->codecpar->extradata = (uint8_t*)av_malloc(cctx->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
+    stream->codecpar->extradata_size = cctx->extradata_size;
+    memcpy(stream->codecpar->extradata, cctx->extradata, cctx->extradata_size);
+  }
 
 //  if ((err = avformat_write_header(ofctx, NULL)) < 0) {
   if ((err = avformat_write_header(ofctx, &fmtOptions)) < 0) {
