@@ -16,15 +16,43 @@
 
 #include "videoenc.h"
 
+
+#include <geotiff.h>
+#include <xtiffio.h>
+#include <tiffio.h>
+#include <geo_normalize.h>
+#include <geo_simpletags.h>
+#include <geovalues.h>
+
+#include <shapefil.h>
+
+#include <cairo.h>
+
+cairo_surface_t *surface=0x00;
+cairo_t *cr=0x00;
+
+
 using namespace std;
 
 const int vwidth=1024;
 const int vheight=768;
 
+struct scounts {
+ int allCases=0;
+ int allICU=0;
+ int allNonICU=0;
+ int allN=0;
+ int allD=0;
+};
+
+
+double xlonMin=180.0,xlonMax=-180.0;
+double ylatMin=90.0,ylatMax=-90.0;
+
 
 typedef ebasicarray<uint32_t> euintarray;
 
-// needed when using random number generator in the arguments!
+// cannot use MIN or MAX macros when using random number generator in the arguments! 
 inline int maxint(int a,int b) { return(a>b?a:b); }
 inline int minint(int a,int b) { return(a<b?a:b); }
 
@@ -49,31 +77,8 @@ void permute(T& arr,int s,int l,ernd& r){
   }
 }
 
-/*
-template<class T>
-void permute_toend(T& arr,int s,ernd& r){
-  for (int i=0; i<s; ++i){
-    int ir=r.uniformint(arr.size());
-    swap(arr[ir],arr[arr.size()-1-i]);
-  }
-}
-*/
-
-
-/*
-
-void permute(ebasicarray<uint8_t>& pop_ages,int ind,int size,ernd& r){
-  for (int i=0; i<size-1; ++i){
-    int ir=r.uniformint(size);
-    if (ir==i) continue;
-    swap(pop_ages[ind+i],pop_ages[ind+ir]);
-  }
-}
-*/
 
 edoublearray delay_gamma(double mu,double shape,double tmax,double tstep);
-
-
 
 class rgamma
 {
@@ -118,7 +123,12 @@ struct shousehold {
 struct sevent {
   int hhid;
   uint8_t transition;
-  uint8_t age;
+  uint8_t hi;
+};
+
+struct sindiv {
+  uint8_t age=0;
+  uint8_t state=0;
 };
 
 class evqueuelist;
@@ -179,6 +189,26 @@ struct sgrid
   int hhIs[ngroups][nlevels];
 };
 
+void addCounts(scounts& dst,scounts& src)
+{
+  dst.allCases+=src.allCases;
+  dst.allICU+=src.allICU;
+  dst.allNonICU+=src.allNonICU;
+  dst.allD+=src.allD;
+}
+
+void addReset(ebasicarray<scounts>& dest,ebasicarray<scounts>& src)
+{
+  ldieif(dest.size()!=src.size(),"uninitialized src or dest?");
+  for (int i=0; i<dest.size(); ++i){
+    addCounts(dest[i],src[i]);
+    src[i].allCases=0;
+    src[i].allICU=0;
+    src[i].allNonICU=0;
+    src[i].allD=0;
+  }
+}
+
 
 typedef void (*threadFunc_t)(ssimstate&,sthreadState&,int,int);
 
@@ -192,6 +222,9 @@ struct sthreadState {
   int allE=0;
   int allCases=0;
 
+  ebasicarray<scounts> shapeCounts;
+  ebasicarray<scounts> ageCounts;
+
   int Ip[ngroups]={0,0};
   int Is[ngroups]={0,0};
   int Ia[ngroups]={0,0};
@@ -203,7 +236,7 @@ struct sthreadState {
 
 struct ssimstate {
   double R0=2.7; // divided by number of days of infectiousness to obtain rate per day
-  const double rSA=0.66; // ratio of Symptomatic/Asymptomatic
+  double rSA=0.66; // ratio of Symptomatic/Asymptomatic
 //  const double iIa=0.5; // infectiosity of asymptomatic
 //  const double iIp=1.0; // infectiosity of presymptomatic
 //  const double iIs=1.0; // infectiosity of presymptomatic
@@ -240,12 +273,15 @@ struct ssimstate {
 
 //  const int ngroups=2; // defined as global now
 
+  ebasicarray<SHPObject*> shapes;
+  ebasicarray<uint8_t> gridMask;
+
   int spGridW=0;
   int spGridH=0;
   int spGridSize=0;
   ebasicarray<sgrid> spGrid;
 
-  ebasicarray<uint8_t> pop_ages;
+  ebasicarray<sindiv> popindiv;
   ebasicarray<shousehold> households;
 
   eintarray hhLevels2;
@@ -266,6 +302,10 @@ struct ssimstate {
   int allICU=0;
   int allNonICU=0;
   int allD=0;
+
+  ebasicarray<scounts> shapeCounts;
+  ebasicarray<scounts> ageCounts;
+
 
   edoublearray localIprob;
   edoublearray travelKernel;
@@ -309,6 +349,7 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
   for (int i=0; i<evs.size(); ++i){
     sevent &e(evs[i]);
     shousehold &hs(st.households[e.hhid]);
+    sindiv &hindiv(st.popindiv[hs.ageind+e.hi]);
     uint8_t hl=hs.size*int(hs.size+1)/2+(hs.size-hs.E);
     sgrid &g(st.spGrid[hs.gridpos]);
 
@@ -320,6 +361,7 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
           ++g.Ip[hs.group];
           ++g.hhIp[hs.group][hl];
           ++hs.Ip;
+          hindiv.state=2; // presymptomatic
           e.transition=2;
           ths.evqueue.add(st,e,st.rIp(r));
         }else{
@@ -328,6 +370,7 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
           ++g.Ia[hs.group];
           ++g.hhIa[hs.group][hl];
           ++hs.Ia;
+          hindiv.state=1; // asymptomatic
           e.transition=1;
           ths.evqueue.add(st,e,st.rIa(r));
         }
@@ -335,6 +378,7 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
       }
       case 1:{
         // Ia ->
+        hindiv.state=10; // recovered
         --ths.Ia[hs.group];
         --g.Ia[hs.group];
         --g.hhIa[hs.group][hl];
@@ -347,37 +391,47 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
         --g.Ip[hs.group];
         --g.hhIp[hs.group][hl];
         --hs.Ip;
+
         ++ths.allCases;
+        ++ths.ageCounts[hindiv.age].allCases;
+        ++ths.shapeCounts[st.gridMask[hs.gridpos]].allCases;
+
         ++ths.Is[hs.group];
         ++g.Is[hs.group];
         ++g.hhIs[hs.group][hl];
         ++hs.Is;
-        e.transition=3;
-        ths.evqueue.add(st,e,st.rIs(r));
+
+        hindiv.state=3;  // symptomatic
         double rf=r.uniform();
-        rf-=st.icu_symp[e.age];
-        if (rf<0.0){
-          e.transition=4;
-          ths.evqueue.add(st,e,st.rToicu(r));
-          if (r.uniform()<st.death_icu[e.age]){
-            e.transition=6;
+        rf-=st.icu_symp[hindiv.age];
+        if (rf<0.0){ // going to icu
+          if (r.uniform()<st.death_icu[hindiv.age]){
+            hindiv.state=20; // will be fatal
+            e.transition=6;  // death
             ths.evqueue.add(st,e,st.rIpDeath(r));
           }
+          e.transition=4; //toicu
+          ths.evqueue.add(st,e,st.rToicu(r));
         }else{
-          rf-=st.nonicu_symp[e.age];
-          if (rf<0.0){
-            e.transition=5;
-            ths.evqueue.add(st,e,st.rTononicu(r));
-            if (r.uniform()<st.death_nonicu[e.age]){
-              e.transition=6;
+          rf-=st.nonicu_symp[hindiv.age];
+          if (rf<0.0){ // going to non icu
+            if (r.uniform()<st.death_nonicu[hindiv.age]){
+              hindiv.state=20; // will be fatal
+              e.transition=6; // death
               ths.evqueue.add(st,e,st.rIpDeath(r));
             }
+            e.transition=5; //tononicu
+            ths.evqueue.add(st,e,st.rTononicu(r));
+          }else{
+            e.transition=3; // recover from symptomatic
+            ths.evqueue.add(st,e,st.rIs(r));
           }
         }
        break;
       }
       case 3:{
         // Ip -> 
+        hindiv.state=10; // recovered
         --ths.Is[hs.group];
         --g.Is[hs.group];
         --g.hhIs[hs.group][hl];
@@ -387,33 +441,90 @@ void processEvents(ssimstate& st,sthreadState& ths,deque<sevent>& evs,ernd& r)
       case 4:{
         // TODO: remove individual from population (stop being infective) once he joins ICU or nonICU, requires keeping track of individual to make sure he is not removed twice, once from Is -> and another time from the ICU, nonICU or death cases, maybe use age value as flag when -1 means he already was removed
 
+        if (hindiv.state==30) // death occurred before NonICU
+          break;
+
         // toicu -> icu
+
+        --ths.Is[hs.group];
+        --g.Is[hs.group];
+        --g.hhIs[hs.group][hl];
+        --hs.Is;
+
         ++ths.allICU;
-        e.transition=7;
-        ths.evqueue.add(st,e,st.rInicu(r));
+        ++ths.ageCounts[hindiv.age].allICU;
+        ++ths.shapeCounts[st.gridMask[hs.gridpos]].allICU;
+
+        if (hindiv.state!=20){ // if state == 20 then individual will die and will not leave ICU
+          e.transition=7;  // recover from ICU
+          ths.evqueue.add(st,e,st.rInicu(r));
+        }
+        hindiv.state=7; // inicu
+
        break;
       }
 
       case 5:{
         // tononicu -> nonicu
+        if (hindiv.state==30) // death occurred before NonICU
+          break;
+
+        --ths.Is[hs.group];
+        --g.Is[hs.group];
+        --g.hhIs[hs.group][hl];
+        --hs.Is;
+
         ++ths.allNonICU;
-        e.transition=8;
-        ths.evqueue.add(st,e,st.rInnonicu(r));
+        ++ths.ageCounts[hindiv.age].allNonICU;
+        ++ths.shapeCounts[st.gridMask[hs.gridpos]].allNonICU;
+
+        if (hindiv.state!=20){ // if state == 20 then individual will die and will not leave ICU
+          e.transition=8; // recover from nonICU
+          ths.evqueue.add(st,e,st.rInnonicu(r));
+        }
+        hindiv.state=8; // in nonicu
        break;
       }
       case 6:{
         // death
         ++ths.allD;
+        ++ths.ageCounts[hindiv.age].allD;
+        ++ths.shapeCounts[st.gridMask[hs.gridpos]].allD;
+        switch (hindiv.state){
+          case 7: 
+            --ths.allICU;
+            --ths.shapeCounts[st.gridMask[hs.gridpos]].allICU;
+           break;
+          case 8: 
+            --ths.allNonICU;
+            --ths.shapeCounts[st.gridMask[hs.gridpos]].allNonICU;
+           break;
+          case 20:
+            // death occurred before ICU or NonICU
+            --ths.Is[hs.group];
+            --g.Is[hs.group];
+            --g.hhIs[hs.group][hl];
+            --hs.Is;
+           break;
+         default:
+           ldie("state not expected");
+          break;
+        }
+        hindiv.state=30;
        break;
       }
       case 7:{
         // icu -> 
+        hindiv.state=10; // recovered
         --ths.allICU;
+        --ths.shapeCounts[st.gridMask[hs.gridpos]].allICU;
        break;
       }
       case 8:{
         // nonicu -> 
+        hindiv.state=10; // recovered
         --ths.allNonICU;
+        --ths.shapeCounts[st.gridMask[hs.gridpos]].allNonICU;
        break;
       }
     }
@@ -510,7 +621,7 @@ void evqueuelist::add(ssimstate &st,sthreadState& ths,int hpos,uint8_t hgroup,ui
         g.hhIs[hgroup][hlnew]+=hst.Is;
 
         for (int l=0; l<ic; ++l){ // queue one event per person to track age of exposed individual
-          ev.age=st.pop_ages[hst.ageind+hst.E+l];
+          ev.hi=hst.E+l;
           eventarr[(ip+i)%eventarr.size()].push_back(ev);
         }
         hst.E+=ic;
@@ -580,22 +691,9 @@ void colorRect(uint8_t *frameRaw,int xb,int yb,int xe,int ye,uint32_t color,int 
 
 inline double clamp(double vmin,double vmax,double v){ v=(v<vmin?vmin:v); return(v>vmax?vmax:v); }
 
-#include <geotiff.h>
-#include <xtiffio.h>
-#include <tiffio.h>
-#include <geo_normalize.h>
-#include <geo_simpletags.h>
-#include <geovalues.h>
 
-#include <shapefil.h>
+//SHPObject *psShape=0x00;
 
-#include <cairo.h>
-
-cairo_surface_t *surface=0x00;
-cairo_t *cr=0x00;
-
-
-SHPObject *psShape=0x00;
 
 static int GTIFReportACorner( GTIF *gtif, GTIFDefn *defn, FILE * fp_out, const char * corner_name, double x, double y)
 {
@@ -656,7 +754,6 @@ int rheight=0;
 int imaxpop=-1;
 
 eintarray popCounts;
-ebasicarray<uint8_t> gridMask;
 
 inline int readPopDensR(uint32_t ix,uint32_t iy){
 //  return(raster[iy*rwidth + ix]==nodataval?0.0:raster[iy*rwidth + ix]); // nodata values are already zeroed
@@ -677,8 +774,8 @@ evector3 tricolor(const evector3& col1,const evector3& col2,const evector3& col3
 }
 
 
-double lonMin=0.0;
-double lonMax=0.0;
+double plonMin=0.0;
+double plonMax=0.0;
 double lonRef=0.0;
 
 double proj(double lon,double lat,double reflon){
@@ -689,17 +786,17 @@ double scale=1.0;
 double xpos=0.0,ypos=0.0;
 
 double revproj(double lon,double lat,double reflon){
-  return(lon/cos(M_PI*lat/180.0)+reflon + lonMin);
+  return(lon/cos(M_PI*lat/180.0)+reflon + plonMin);
 }
 
 
 void cairoDrawShape(cairo_t *cr,SHPObject *shp,float x,float y,float s,bool projection,float height,bool inverted){
   for (int j=0, iPart=1; j<shp->nVertices; ++j){
-    float sx=s*(shp->padfX[j]-shp->dfXMin)+x;
+    float sx=s*(shp->padfX[j]-xlonMin)+x;
     if (projection)
-      sx=s*(proj(shp->padfX[j],shp->padfY[j],lonRef)-lonMin)+x;
+      sx=s*(proj(shp->padfX[j],shp->padfY[j],lonRef)-plonMin)+x;
     
-    float sy=s*(shp->padfY[j]-shp->dfYMin)+y;
+    float sy=s*(shp->padfY[j]-ylatMin)+y;
     if (inverted)
       sy=height-sy;
     if (j == 0 && shp->nParts > 0 )
@@ -752,16 +849,16 @@ void renderFrame(char *daystr,float mitigation,int newCases,uint8_t *frameRaw,ss
 //  memset(frameRaw, 0, 1920*1080*4);
 //  videoPushFrame(frameRaw);
 //  return;
-  if ((lonMax-lonMin)/(psShape->dfYMax-psShape->dfYMin) > double(width)/height){
-    scale=width/(lonMax-lonMin);
-    ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
+  if ((plonMax-plonMin)/(ylatMax-ylatMin) > double(width)/height){
+    scale=width/(plonMax-plonMin);
+    ypos=(height-scale*(ylatMax-ylatMin))/2.0;
   }else{
-    scale=height/(psShape->dfYMax-psShape->dfYMin);
-    xpos=(width-scale*(lonMax-lonMin))/2.0;
+    scale=height/(ylatMax-ylatMin);
+    xpos=(width-scale*(plonMax-plonMin))/2.0;
   }
   scale=0.9*scale;
-  ypos=(height-scale*(psShape->dfYMax-psShape->dfYMin))/2.0;
-  xpos=(width-scale*(lonMax-lonMin))/2.0;
+  ypos=(height-scale*(ylatMax-ylatMin))/2.0;
+  xpos=(width-scale*(plonMax-plonMin))/2.0;
 
   double maxE=0.0;
   double maxI=0.0;
@@ -782,24 +879,25 @@ void renderFrame(char *daystr,float mitigation,int newCases,uint8_t *frameRaw,ss
 
   for (int i=0; i<st.spGridW; ++i){
     for (int j=0; j<st.spGridH; ++j){
-      double xlon=i*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
-      double ylat=(st.spGridH-j-1)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+      if (st.gridMask[j*rwidth+i]==0) continue;
+      double xlon=i*(xlonMax-xlonMin)/st.spGridW+xlonMin;
+      double ylat=(st.spGridH-j-1)*(ylatMax-ylatMin)/st.spGridH+ylatMin;
 
-      double xlonn=(i+1)*(psShape->dfXMax-psShape->dfXMin)/st.spGridW+psShape->dfXMin;
-      double ylatn=(st.spGridH-j)*(psShape->dfYMax-psShape->dfYMin)/st.spGridH+psShape->dfYMin;
+      double xlonn=(i+1)*(xlonMax-xlonMin)/st.spGridW+xlonMin;
+      double ylatn=(st.spGridH-j)*(ylatMax-ylatMin)/st.spGridH+ylatMin;
 
-      double sx=scale*(proj(xlon,ylat,lonRef)-lonMin)+xpos;
-      double sy=height-scale*(ylat-psShape->dfYMin)-ypos;
+      double sx=scale*(proj(xlon,ylat,lonRef)-plonMin)+xpos;
+      double sy=height-scale*(ylat-ylatMin)-ypos;
 
-      double sxn=scale*(proj(xlonn,ylatn,lonRef)-lonMin)+xpos+1.0; // 1.0 is added to avoid tears
-      double syn=height-scale*(ylatn-psShape->dfYMin)-ypos-1.0;
+      double sxn=scale*(proj(xlonn,ylatn,lonRef)-plonMin)+xpos+1.0; // 1.0 is added to avoid tears
+      double syn=height-scale*(ylatn-ylatMin)-ypos-1.0;
 
       sgrid &g(st.spGrid[j*st.spGridW+i]);
       double tmpI=double(g.Ia[0]+g.Ia[1]+g.Ip[0]+g.Ip[1]+g.Is[0]+g.Is[1])/(g.N[0]+g.N[1]);
       double tmpE=(g.N[0]+g.N[1]==0?0.0:double(g.E)/(g.N[0]+g.N[1]));
       float pdens=clamp(0.0,1.0,(log(readPopDensR(i,j)+0.5)-log(0.5))/(log(rmaxpop+0.5)-log(0.5))*0.6+0.4);
       uint32_t color=tricolorint(evector3(1.0,1.0,1.0)*pdens,evector3(0.3,0.8,0.3),evector3(1.0,0.0,0.0),tmpE,clamp(0.0,1.0,(log(tmpI+0.001)-log(0.001))/(-log(0.001))));
-      if (gridMask[j*st.spGridW+i]==0)
+      if (st.gridMask[j*st.spGridW+i]==0)
         color=0xFFFFFF;
       colorRect(frameRaw,sx,sy,sxn,syn,color,width);
     }
@@ -854,12 +952,11 @@ void renderFrame(char *daystr,float mitigation,int newCases,uint8_t *frameRaw,ss
   // tell cairo we have changed the image contents
   cairo_surface_mark_dirty(surface);
 
-/*
-  cairoDrawShape(cr,psShape,xpos,ypos,scale,true,height,true);
-  cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+  for (int i=0; i<st.shapes.size(); ++i)
+    cairoDrawShape(cr,st.shapes[i],xpos,ypos,scale,true,height,true);
+  cairo_set_source_rgb(cr, 0.0, 0.0, 1.0);
   cairo_set_line_width(cr, 1);
   cairo_stroke (cr);
-*/
 
   cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
   cairo_move_to (cr, 10.0, 50.0);
@@ -1035,8 +1132,8 @@ int loadPopDens(const estr& fname){
   uint32_t rymin=0;
   uint32_t rymax=0;
 
-  double sX=psShape->dfXMin;
-  double sY=psShape->dfYMin;
+  double sX=xlonMin;
+  double sY=ylatMin;
   cerr << "top left of shape: " << sX << " " << sY << endl;
   GTIFPCSToImage( gtif, &sX,&sY );
   cerr << "top left of shape: " << sX << " " << sY << endl;
@@ -1044,8 +1141,8 @@ int loadPopDens(const estr& fname){
   rxmin=sX;
   rymin=sY;
 
-  sX=psShape->dfXMax;
-  sY=psShape->dfYMax;
+  sX=xlonMax;
+  sY=ylatMax;
   cerr << "bottom right of shape: " << sX << " " << sY << endl;
   GTIFPCSToImage( gtif, &sX,&sY );
   cerr << "bottom right of shape: " << sX << " " << sY << endl;
@@ -1110,11 +1207,11 @@ int loadPopDens(const estr& fname){
 
 int getGrid(double lat,double lon)
 {
-  if (psShape->dfYMin>lat || psShape->dfYMax<lat || psShape->dfXMin>lon || psShape->dfXMax<lon) return(-1);
-  return((rheight-uint32_t((lat-psShape->dfYMin)*rheight/(psShape->dfYMax-psShape->dfYMin)))*rwidth+uint32_t((lon-psShape->dfXMin)*rwidth/(psShape->dfXMax-psShape->dfXMin)));
+  if (ylatMin>lat || ylatMax<lat || xlonMin>lon || xlonMax<lon) return(-1);
+  return((rheight-uint32_t((lat-ylatMin)*rheight/(ylatMax-ylatMin)))*rwidth+uint32_t((lon-xlonMin)*rwidth/(xlonMax-xlonMin)));
 }
 
-void adjustPopCounts(int popsize)
+void adjustPopCounts(ssimstate& st,int popsize)
 {
   cairo_surface_t *surfacemask=0x00;
   cairo_t *crmask=0x00;
@@ -1132,19 +1229,38 @@ void adjustPopCounts(int popsize)
   cerr << "# stride A8 width: " << rwidth << " stride: " << cairo_format_stride_for_width (CAIRO_FORMAT_A8,rwidth) << endl;
   ldieif(cstatus!=CAIRO_STATUS_SUCCESS,"error creating surface: "+estr(cstatus));
   crmask=cairo_create(surfacemask); 
-  cairoDrawShape(crmask,psShape,0.0,0.0,float(rwidth)/(psShape->dfXMax-psShape->dfXMin),false,rheight,true);
 
-  cairo_set_source_rgb(crmask,1.0,1.0,1.0);
-  cairo_fill(crmask);
+  cairo_surface_t *colorSurf=0x00;
+  int colorRow=cairo_format_stride_for_width(CAIRO_FORMAT_A8,1);
+  uint8_t *colorData=new uint8_t[1*colorRow];
+  colorData[0]=1u;
+  colorSurf=cairo_image_surface_create_for_data(colorData,CAIRO_FORMAT_A8,1,1,colorRow);
+//  cairo_pattern_t *colorPattern=cairo_pattern_create_for_surface(colorSurf);
+
+  for (int i=0; i<st.shapes.size(); ++i){
+    // color code each region
+    colorData[0]=i+1;
+    cairo_surface_mark_dirty(colorSurf);
+    
+    cairo_set_source_surface(crmask,colorSurf,0.0,0.0);
+    cairo_pattern_set_extend(cairo_get_source(crmask),CAIRO_EXTEND_REPEAT); // repeat the pattern
+//    cairo_set_source_rgb(crmask,(i+1+0.5)/255.0,(i+1+0.5)/255.0,(i+1+0.5)/255.0);
+    cairoDrawShape(crmask,st.shapes[i],0.0,0.0,float(rwidth)/(xlonMax-xlonMin),false,rheight,true);
+    cairo_fill(crmask);
+  }
+
   cairo_surface_flush(surfacemask);
   cairo_destroy(crmask);
   cairo_surface_destroy(surfacemask);
+//  cairo_pattern_destroy(colorPattern);
+  cairo_surface_destroy(colorSurf);
+  delete[] colorData;
  
   
-  gridMask.init(rwidth*rheight);
+  st.gridMask.init(rwidth*rheight);
   for (int i=0; i<rheight; ++i){
     for (int j=0; j<rwidth; ++j)
-      gridMask[i*rwidth+j]=shapeMask[i*shapeRow+j];
+      st.gridMask[i*rwidth+j]=shapeMask[i*shapeRow+j];
   }
   delete[] shapeMask;
 
@@ -1154,7 +1270,7 @@ void adjustPopCounts(int popsize)
   int totalpopsize=0;
   for (int i=0; i<popCounts.size(); ++i){
     totalpopsize+=popCounts[i];
-    if (gridMask[i]==0) { popCounts[i]=0; continue; }
+    if (st.gridMask[i]==0) { popCounts[i]=0; continue; }
     if (popCounts[i]>rmaxpop) { imaxpop=i;  rmaxpop=popCounts[i]; }
     rpopsize+=popCounts[i];
   }
@@ -1188,6 +1304,18 @@ void adjustPopCounts(int popsize)
   popCounts[imaxpop]+=popsize-rpopsize;
   rmaxpop=popCounts[imaxpop];
   cerr << "adjusted rmaxpop: " << rmaxpop << endl;
+
+  for (int i=0; i<st.gridMask.size(); ++i){
+    int gm=st.gridMask[i];
+    ldieif(gm<0 || gm>=st.shapeCounts.size(),"gridMask value out of bounds: "+estr(gm)+" "+st.shapeCounts.size());
+    st.shapeCounts[gm].allN+=popCounts[i];
+  }
+
+  cerr << "# shapeCounts" << endl;
+  for (int i=0; i<st.shapeCounts.size(); ++i){
+    cerr << i << " " << st.shapeCounts[i].allN << endl;
+  }
+
 
 
 //  exit(0);
@@ -1292,7 +1420,7 @@ void loadDBF(const estr& fname,const estrarray& selection,estrarrayof<int>& shpl
     for (int j=0; j<selection.size(); ++j){
       estr fname=selection.keys(j);
       bool exclude=false;
-      if (selection.keys(j)[0]=='!'){
+      if (selection.keys(j)[0]=='-'){
         exclude=true;
         fname=selection.keys(j).substr(1);
       }
@@ -1344,12 +1472,10 @@ void loadDBF(const estr& fname,const estrarray& selection,estrarrayof<int>& shpl
   DBFClose( hDBF );
 }
 
-void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-1000.0){
+void loadShape(ssimstate& st,const estr& fname,const estrarray& selection,double lonLimit=-1000.0){
 
   estrarrayof<int> shplist;
   loadDBF(fname.substr(0,-5)+".dbf",selection,shplist);
-  exit(0);
-
 
   SHPHandle hSHP;
   int nShapeType, nEntities;
@@ -1375,20 +1501,24 @@ void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-100
             nPrecision, adfMaxBound[3] ); 
 */
 
-  ldieif(nEntities>1,"more than one shape entity found");
+  st.shapeCounts.add(scounts()); // outside the shapes
 
-//  for (int i=0; i<nEntities; ++i){
+  for (int i=0; i<nEntities; ++i){
+    if (nEntities>1 && shplist.find(i)==-1) continue; // if there is only one shape, take it, otherwise use the list
+
     int j;
-//    SHPObject *psShape;
+    SHPObject *tmpShape;
 
-    psShape = SHPReadObject(hSHP, 0);
+    tmpShape = SHPReadObject(hSHP, i);
 
-    if (psShape == NULL) {
-      fprintf( stderr,
-                   "Unable to read shape %d, terminating object reading.\n",
-                    0 );
-//      break;
-    }else{
+    ldieif (tmpShape == NULL,"Unable to read shape "+estr(i)+" in file: "+fname);
+    xlonMin=MIN(xlonMin,tmpShape->dfXMin);
+    xlonMax=MAX(xlonMax,tmpShape->dfXMax);
+    ylatMin=MIN(ylatMin,tmpShape->dfYMin);
+    ylatMax=MAX(ylatMax,tmpShape->dfYMax);
+    st.shapes.add(tmpShape);
+    st.shapeCounts.add(scounts());
+
 /*
       printf( "\nShape:%d (%s)  nVertices=%d, nParts=%d\n"
                   "  Bounds:(%.*g,%.*g, %.*g)\n"
@@ -1402,10 +1532,11 @@ void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-100
                     nPrecision, psShape->dfYMax,
                     nPrecision, psShape->dfZMax ); 
 */
-    }
+    
 //    SHPDestroyObject(psShape);
-//  }
+  }
 
+/*
   int tj=0;
   int tiPart=1;
 
@@ -1446,6 +1577,7 @@ void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-100
 //      cerr << "i: "<< i << " " << psShape->panPartStart[i] << endl;
     cerr << "Reduced shape with lonLimit: " << psShape->nVertices << " to " << tj << endl;
     psShape->nVertices=tj;
+*/
 /*
       printf( "\nNew Shape:%d (%s)  nVertices=%d, nParts=%d\n"
                   "  Bounds:(%.*g,%.*g, %.*g)\n"
@@ -1458,16 +1590,21 @@ void loadShape(const estr& fname,const estrarray& selection,double lonLimit=-100
                     nPrecision, psShape->dfXMax,
                     nPrecision, psShape->dfYMax,
                     nPrecision, psShape->dfZMax ); 
-*/
   }
+*/
     
 
-  lonRef=(psShape->dfXMax+psShape->dfXMin)/2.0;
-  for (int j=0; j<psShape->nVertices; ++j){
-    double tmpLon=proj(psShape->padfX[j],psShape->padfY[j],lonRef);
-    if (j==0 || tmpLon<lonMin) lonMin=tmpLon;
-    if (j==0 || tmpLon>lonMax) lonMax=tmpLon;
+
+  // find projected min and max longitudes
+  lonRef=(xlonMax+xlonMin)/2.0;
+  for (int i=0; i<st.shapes.size(); ++i){
+    for (int j=0; j<st.shapes[i]->nVertices; ++j){
+      double tmpLon=proj(st.shapes[i]->padfX[j],st.shapes[i]->padfY[j],lonRef);
+      if (i==0 && j==0 || tmpLon<plonMin) plonMin=tmpLon;
+      if (i==0 && j==0 || tmpLon>plonMax) plonMax=tmpLon;
+    }
   }
+
 /*
   double cx=(psShape->dfXMax-psShape->dfXMin)/2.0;
   for (int j=0; j<psShape->nVertices; ++j)
@@ -1641,6 +1778,25 @@ void threadSeedInfections(ssimstate& st,sthreadState& ths,int i,int n)
   }
 }
 
+void threadCopyResetState(ssimstate &st,sthreadState& ths)
+{
+  st.allCases+=ths.allCases;
+  ths.allCases=0;
+  st.allE+=ths.allE;
+  ths.allE=0;
+  st.allICU+=ths.allICU; ths.allICU=0;
+  st.allNonICU+=ths.allNonICU; ths.allNonICU=0;
+  st.allD+=ths.allD; ths.allD=0;
+  for (int i=0; i<ngroups; ++i){
+    st.Ip[i]+=ths.Ip[i];
+    st.Is[i]+=ths.Is[i];
+    st.Ia[i]+=ths.Ia[i];
+    ths.Ip[i]=0; ths.Is[i]=0; ths.Ia[i]=0;
+  }
+  addReset(st.shapeCounts,ths.shapeCounts);
+  addReset(st.ageCounts,ths.ageCounts);
+}
+
 void threadRun(ssimstate &st)
 {
 //  sthreadState ths;
@@ -1660,19 +1816,7 @@ void threadRun(ssimstate &st)
     // copy thead state
     if (threadI>=0){
       sthreadState &ths(st.threadStates[threadI]);
-      st.allCases+=ths.allCases;
-      ths.allCases=0;
-      st.allE+=ths.allE;
-      ths.allE=0;
-      st.allICU+=ths.allICU; ths.allICU=0;
-      st.allNonICU+=ths.allNonICU; ths.allNonICU=0;
-      st.allD+=ths.allD; ths.allD=0;
-      for (int i=0; i<ngroups; ++i){
-        st.Ip[i]+=ths.Ip[i];
-        st.Is[i]+=ths.Is[i];
-        st.Ia[i]+=ths.Ia[i];
-        ths.Ip[i]=0; ths.Is[i]=0; ths.Ia[i]=0;
-      }
+      threadCopyResetState(st,ths);
     }
 
     st.doneSignal.signal();
@@ -1723,6 +1867,12 @@ int emain()
   ssimstate st;
   epregister2(st.R0,"r0");
 
+  double cf=1.0;
+  epregister2(cf,"cf"); // correction for ratio of Symptomatic/Asymptomatic, can be as high as 0.37 according to preliminary results from Streeck
+
+  double df=1.0;
+//  epregister2(df,"df"); // correction for unclassified covid deaths, preliminary results from increased number of fatalities compared to historical data show that covid deaths are being underreported by about 20%
+
   int agethres=50;
   epregister(agethres);
 
@@ -1758,7 +1908,9 @@ int emain()
   epregister2(st.flocal,"flocal");
   estr fpop="data/switzerland.agegroups";
   epregister(fpop);
-  estr fshape="data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp";
+//  estr fshape="data/popdensmaps/gadm36_CHE/gadm36_CHE_0.shp";
+  estr fshape="data/popdensmaps/ref-nuts/NUTS_RG_01M_2016_4326_LEVL_2.shp";
+ 
   epregister(fshape);
 //  int fseed=10;
 //  epregister2(st.fseed,"fseed");
@@ -1793,6 +1945,10 @@ int emain()
   int casestrigger=-1;
   epregister(casestrigger);
 
+  int icutrigger=-1;
+  epregister(icutrigger);
+
+
   double rthres=0.99;
   double rthres2=0.95;
   epregister(rthres);
@@ -1811,9 +1967,12 @@ int emain()
   epregister(it);
 
   estrarray shpsel;
+  shpsel.add("CNTR_CODE","CH");
   epregister(shpsel);
 
   eparseArgs();
+
+  st.rSA=st.rSA*cf; // correction for ratio of symptomatic/asymptomatic. Preliminary results from Hendrik Streeck show that this might be overestimated by 1.0/0.37 times
 
   ethreadFunc bgThread;
   if (sfile.len())
@@ -1864,8 +2023,7 @@ int emain()
 
   cerr << "# shpsel: " << shpsel << endl;
 
-  loadShape(fshape,shpsel,lonLimit);
-  exit(0);
+  loadShape(st,fshape,shpsel,lonLimit);
 //  loadPopDens("data/popdensmaps/gpw_v4_population_density_rev11_2020_2pt5_min.tif");
 
   loadPopDens("data/popdensmaps/gpw_v4_population_count_adjusted_to_2015_unwpp_country_totals_rev11_2020_30_sec.tif"); // loads population counts raster data
@@ -1874,7 +2032,7 @@ int emain()
   uint8_t *frameraw = new uint8_t[vwidth*vheight*4];
   initCairo(frameraw,vwidth,vheight); // initCairo after loadShape because it initializes a shapemask and after loading population raster data, to have a grid defined already
 
-  adjustPopCounts(popsize);
+  adjustPopCounts(st,popsize);
 
   
 
@@ -1917,16 +2075,17 @@ int emain()
   st.nonicu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],sumarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0));
   st.death_icu=edoublearray(agegroup_infparams["Prop_critical_fatal"]);
   st.death_nonicu=edoublearray(agegroup_infparams["Prop_noncritical_fatal"]);
+  // need to add a separate death from covid outside of hospital care to account for underreporting of covid deaths (around 20%)
 
   double totcritical=0.0,totdeaths=0.0;
   for (int i=0; i<agegroups.size(); ++i){
     totcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
-    totdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i]);
+    totdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
   }
   double tmpcritical=0.0,tmpdeaths=0.0;
   for (int i=0; i<agegroups.size(); ++i){
     tmpcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
-    tmpdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i]);
+    tmpdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
     cerr << "# age: " << 5*i << " critical: " << tmpcritical << " (" << tmpcritical/totcritical << ")" << " deaths: " << tmpdeaths << " (" << tmpdeaths/totdeaths << ")" <<endl;
   }
 
@@ -1952,8 +2111,12 @@ int emain()
   st.rIs=rgamma(3.5,4.0,60.0,0.25); // 3.5 days as symptomatic
   st.rIa=rgamma(5.0,4.0,60.0,0.25); // 5 days infectious as asymptomatic
 
+//  st.rTononicu=rgamma(4.0,4.0,60.0,0.25); // 4 days to go to NonICU, changed from Davis model which had 7 days
+//  st.rToicu=rgamma(3.0,3.0,60.0,0.25); // 3 days to go to ICU after being in NonICU, this will now be after being in NonICU
+
   st.rToicu=rgamma(7.0,7.0,60.0,0.25); // 7 days to go to ICU
-  st.rTononicu=rgamma(7.0,7.0,60.0,0.25); // 7 days to go to ICU
+  st.rTononicu=rgamma(7.0,7.0,60.0,0.25); // 7 days to go to NonICU
+
   st.rInicu=rgamma(10.0,10.0,60.0,0.25); // 10 days in ICU
   st.rInnonicu=rgamma(8.0,8.0,60.0,0.25); // 8 days in nonICU
   st.rIpDeath=rgamma(22.0,22.0,60.0,0.25); // deaths occuring 22 days after symptoms
@@ -1997,7 +2160,7 @@ int emain()
 
 
 
-  st.pop_ages.init(popsize,0);
+  st.popindiv.init(popsize);
 
   
   cerr << householdSizeDist << endl;
@@ -2016,28 +2179,28 @@ int emain()
     for (int j=0; j<hhlist[i].size(); ++j){
       shousehold &sh(st.households[hhlist[i][j]]);
       do {
-        ldieif(sh.ageind<0 || sh.ageind>=st.pop_ages.size(),"out of bounds: "+estr(sh.ageind)+" "+st.pop_ages.size());
-        st.pop_ages[sh.ageind]=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
-        ldieif(st.pop_ages[sh.ageind]<0 || st.pop_ages[sh.ageind]>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.pop_ages[sh.ageind])+" "+tmpag.size());
+        ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
+        st.popindiv[sh.ageind].age=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
+        ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size());
 //        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
-      } while (tmpag[st.pop_ages[sh.ageind]]==0);
-      --tmpag[st.pop_ages[sh.ageind]];
+      } while (tmpag[st.popindiv[sh.ageind].age]==0);
+      --tmpag[st.popindiv[sh.ageind].age];
       ++assigned;
 
 //      // use single agegroup for hhLevels
 //      sh.hage=0; //st.pop_ages[sh.ageind];
 
       // age group of "oldest" person in house
-      sh.hage=st.pop_ages[sh.ageind];
+      sh.hage=st.popindiv[sh.ageind].age;
       sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
 
       if (i>1){
         do {
-          ldieif(sh.ageind+1<0 || sh.ageind+1>=st.pop_ages.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.pop_ages.size());
-          st.pop_ages[sh.ageind+1]=minint(st.pop_ages[sh.ageind]+int(rnd.uniformint(3))-2,tmpag.size()-1);
-          ldieif(st.pop_ages[sh.ageind+1]<0 || st.pop_ages[sh.ageind+1]>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.pop_ages[sh.ageind+1])+" "+tmpag.size());
-        } while (tmpag[st.pop_ages[sh.ageind+1]]==0);
-        --tmpag[st.pop_ages[sh.ageind+1]];
+          ldieif(sh.ageind+1<0 || sh.ageind+1>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.popindiv.size());
+          st.popindiv[sh.ageind+1].age=minint(st.popindiv[sh.ageind].age+int(rnd.uniformint(3))-2,tmpag.size()-1);
+          ldieif(st.popindiv[sh.ageind+1].age<0 || st.popindiv[sh.ageind+1].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind+1].age)+" "+tmpag.size());
+        } while (tmpag[st.popindiv[sh.ageind+1].age]==0);
+        --tmpag[st.popindiv[sh.ageind+1].age];
 //        if (avgage)
 //          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
         ++assigned;
@@ -2045,20 +2208,20 @@ int emain()
       // Children
       for (int l=2; l<i; ++l){
         do {
-          if (tmpag[MAX(0,st.pop_ages[sh.ageind]-9)]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+1]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+2]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+3]==0)
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + 4 + int(rnd.uniformint(3));
-          else if (tmpag[MAX(0,st.pop_ages[sh.ageind]-9)]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+1]+tmpag[MAX(0,st.pop_ages[sh.ageind]-9)+2]==0)
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + 3;
+          if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+3]==0)
+            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 4 + int(rnd.uniformint(3));
+          else if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]==0)
+            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 3;
           else
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-9) + int(rnd.uniformint(3));
+            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + int(rnd.uniformint(3));
 /*
           if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
             st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
           else
             st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
 */
-        } while (tmpag[st.pop_ages[sh.ageind+l]]==0);
-        --tmpag[st.pop_ages[sh.ageind+l]];
+        } while (tmpag[st.popindiv[sh.ageind+l].age]==0);
+        --tmpag[st.popindiv[sh.ageind+l].age];
         ++assigned;
 //        if (avgage)
 //          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
@@ -2253,19 +2416,19 @@ int emain()
     sh.hstind=st.hhLevelsBegin[sh.gridpos*st.grow + hg*st.arow + hl+1]-st.hhLevelsBegin[sh.gridpos*st.grow + hg*st.arow + hl];
     ++st.hhLevelsBegin[sh.gridpos*st.grow + hg*st.arow + hl+1]; // end of subarray is beginning of the next level
 
-    uint8_t *agearr=&st.pop_ages[sh.ageind];
+    sindiv *agearr=&st.popindiv[sh.ageind];
     if (hg>=1){
       ++hhOlder;
       hhOlderN+=sh.size;
       for (int l=0; l<sh.size; ++l){
-        if (agearr[l]>=agethres/5)
+        if (agearr[l].age>=agethres/5)
           ++hhOlderNO;
         else
           ++hhOlderNY;
       }
     }else{
       for (int l=0; l<sh.size; ++l){
-        if (agearr[l]>=agethres/5)
+        if (agearr[l].age>=agethres/5)
           ++hhYoungNO;
         else
           ++hhYoungNY;
@@ -2288,7 +2451,7 @@ int emain()
     shousehold &hh(st.households[i]);
     if (hh.size==1) continue; // cannot randomize single households
     uint8_t hl=hh.size*(hh.size+1)/2+hh.size;
-    permute(st.pop_ages,hh.ageind,hh.size,rnd);
+    permute(st.popindiv,hh.ageind,hh.size,rnd);
   }
 
 
@@ -2372,7 +2535,7 @@ int emain()
   double sump=0.0;
   for (int i=0; i<11; ++i){
     for (int j=0; j<11; ++j){
-      int xf=double(i-5),yf=double(j-5);
+      int xf=double(i-5)*cos(M_PI*(ylatMin*0.5+ylatMax*0.5)/180.0),yf=double(j-5); // normalize x-axis distance by average latitude correction due to angle to distance correction
       st.travelKernel[j*11+i]=gsl_ran_gaussian_pdf(sqrt(xf*xf+yf*yf),ftravel);
       sump+=st.travelKernel[j*11+i];
     }
@@ -2389,21 +2552,6 @@ int emain()
 
   cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
 
-  ethreads t;
-
-  t.setThreads(st.nthreads);
-  st.threadDone=st.nthreads;
-  for (int i=0; i<st.nthreads; ++i){
-    st.threadStates.addref(new sthreadState);
-    st.threadStates[i].evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
-  }
-
-  t.run(threadRun,evararray(evarRef(st)));
-
-  st.mutex.lock();
-  while (st.threadDone>0) st.doneSignal.wait(st.mutex);
-  st.mutex.unlock();
-  cerr << "#starting simulation" << endl;
 
 
 
@@ -2423,6 +2571,28 @@ int emain()
       st.iseedArr.add(imaxpop,tmparr[0].i());
     }
   }
+
+
+  st.ageCounts.init(agegroups.size());
+
+  ethreads t;
+
+  t.setThreads(st.nthreads);
+  st.threadDone=st.nthreads;
+  for (int i=0; i<st.nthreads; ++i){
+    st.threadStates.addref(new sthreadState);
+    st.threadStates[i].evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
+    st.threadStates[i].ageCounts.init(agegroups.size());
+    st.threadStates[i].shapeCounts.init(st.shapeCounts.size());
+  }
+
+  t.run(threadRun,evararray(evarRef(st)));
+
+  st.mutex.lock();
+  while (st.threadDone>0) st.doneSignal.wait(st.mutex);
+  st.mutex.unlock();
+  cerr << "#starting simulation" << endl;
+
 
 
 
@@ -2451,6 +2621,8 @@ int emain()
   int newICU=0,lastICU=0,lastICU2=0;
   char tmpsz[255];
   double Reff=1.0;
+  double ReffICU=1.0;
+  int triggerCount=0;
 
   double tmpicusmr=-1.0;
 
@@ -2483,6 +2655,7 @@ int emain()
       
 //      Reff=(lastCases==lastCases2?1.0:5.0*double((st.allCases-lastCases))/(lastCases-lastCases2)); 
       Reff=Reff*2.0/3.0+((lastCases==lastCases2?1.0:pow(double(st.allCases-lastCases)/(lastCases-lastCases2),5.0))/3.0); 
+      ReffICU=ReffICU*2.0/3.0+((lastICU==lastICU2?1.0:pow(double(st.allICU-lastICU)/(lastICU-lastICU2),5.0))/3.0); 
 //      cout << "st.allCases: " << st.allCases << " lastCases: " << lastCases << " lastCases2: " << lastCases2 << endl;
 //      Reff=(st.allCases-lastCases)/(lastCases-lastCases2); 
       renderFrame(tmpsz,st.smr,newCases,frameraw,st,vwidth,vheight);
@@ -2494,6 +2667,24 @@ int emain()
       ++timeinfo->tm_mday;
       mktime(timeinfo);
 //      if (tmpicusmr<0.0 && st.allICU+18*newICU+18*(18+1)*newDeltaICU/2>iculimit){
+
+      if (iculimit>=0 && Reff<rthres2 && st.allICU<0.8*iculimit && tmpicusmr>=0.0){
+        st.smr=tmpicusmr;
+        tmpicusmr=-1.0;
+        cerr << "# low ICU remove icu limit: " << " " << st.smr << endl;
+      } else if (iculimit>=0 && Reff<rthres && st.allICU<0.9*iculimit && tmpicusmr>=0.0){
+        st.smr=0.40*ftrigger;
+        cerr << "# Reducing isolation: " << " " << st.smr << endl;
+      } else if (icutrigger>=0.0 && newICU>icutrigger && triggerCount<1){
+        if (tmpicusmr<0.0){
+          tmpicusmr=st.smr;
+//          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
+          st.smr=0.3*ftrigger;
+          cerr << "# ICU capacity triggered icu limit: " << st.allICU*exp(5*log(Reff)) << " " << st.smr << endl;
+          ++triggerCount;
+        }
+      }
+/*
       if (iculimit>=0 && Reff<rthres2 && st.allICU<0.8*iculimit && tmpicusmr>=0.0){
         st.smr=tmpicusmr;
         tmpicusmr=-1.0;
@@ -2501,14 +2692,16 @@ int emain()
       } else if (iculimit>=0 && Reff<rthres && st.allICU<0.9*iculimit && tmpicusmr>=0.0){
         st.smr=0.5*ftrigger;
         cerr << "# Reducing isolation: " << " " << st.smr << endl;
-      } else if (casestrigger>=0.0 && newCases>casestrigger && fE<0.2){
+      } else if (casestrigger>=0.0 && newCases>casestrigger && triggerCount<1){
         if (tmpicusmr<0.0){
           tmpicusmr=st.smr;
 //          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
           st.smr=0.3*ftrigger;
           cerr << "# ICU capacity triggered icu limit: " << st.allICU*exp(5*log(Reff)) << " " << st.smr << endl;
+          ++triggerCount;
         }
       }
+*/
     }
 
 //    double interhhrate=(hage>=10?folder:1.0)*finter*st.R0*(1.0-fE)*(0.5*st.allIa+st.allIp+st.allIs)/(popsize-st.allE);
