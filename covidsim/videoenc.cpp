@@ -9,6 +9,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "videoenc.h"
+
 
 
 AVFrame *videoFrame = nullptr;
@@ -162,20 +164,20 @@ static void free(){
   }
 }
 
-int videoOpen(int width,int height,int _fps,int bitrate)
+int videoOpen(const estr& fname,int width,int height,int _fps,int bitrate)
 {
   fps=_fps;
   av_register_all();
   avcodec_register_all();
 
-  oformat = av_guess_format(nullptr, "test.mp4", nullptr);
+  oformat = av_guess_format(nullptr, fname._str, nullptr);
   if (!oformat) {
     std::cout << "can't create output format" << std::endl;
     return -1;
   }
 //  oformat->video_codec = AV_CODEC_ID_H265;
 
-  int err = avformat_alloc_output_context2(&ofctx, oformat, nullptr, "test.mp4");
+  int err = avformat_alloc_output_context2(&ofctx, oformat, nullptr, fname._str);
   if (err){
     std::cout << "can't create output context" << std::endl;
     return -1;
@@ -316,7 +318,7 @@ int videoOpen(int width,int height,int _fps,int bitrate)
 */
 
   if (!(oformat->flags & AVFMT_NOFILE)) {
-    if ((err = avio_open(&ofctx->pb, "test.mp4", AVIO_FLAG_WRITE)) < 0) {
+    if ((err = avio_open(&ofctx->pb, fname._str, AVIO_FLAG_WRITE)) < 0) {
         std::cout << "Failed to open file" << err << std::endl;
         return -1;
     }

@@ -599,7 +599,7 @@ void evqueuelist::add(ssimstate &st,sthreadState& ths,int hpos,uint8_t hgroup,ui
         g.hhIs[hgroup][hl]-=hst.Is;
 
         // this code is implemented like this for efficiency reasons
-        // all households indices in the different levels are all stored in a single large array grouped by levels
+        // households indices in the different levels are all stored in a single large array grouped by levels
         // the start of each subarray level is stored in the hhLevelsBegin array
         // to move a household to another level, I just swap the household to the beginning of the level subarray
         // and then increment the beginning of that subarray level, effectively removing it from the current level to the previous one
@@ -1864,6 +1864,12 @@ int findPopGrid(ssimstate& st,double lat,double lon,int seedcount){
 
 int emain()
 {
+  bool printregions=false;
+  epregister(printregions);
+
+  int rseed=-1;
+  epregister(rseed);
+
   ssimstate st;
   epregister2(st.R0,"r0");
 
@@ -1897,6 +1903,9 @@ int emain()
   epregister(tmstart);
   epregister(tmend);
 */
+
+  estr ovideo;
+  epregister(ovideo);
 
   double tmax=300.0;
   epregister(tmax);
@@ -1948,6 +1957,15 @@ int emain()
   int icutrigger=-1;
   epregister(icutrigger);
 
+  int oisotrigger=-1;
+  epregister(oisotrigger);
+
+  double oisorelease=-1;
+  epregister(oisorelease);
+
+  double foiso=0.05;
+  epregister(foiso);
+
 
   double rthres=0.99;
   double rthres2=0.95;
@@ -1955,11 +1973,31 @@ int emain()
   epregister(rthres2);
 
 
-  int iculimit=-1;
-  epregister(iculimit);
+  int iculowlimit=-1;
+  epregister(iculowlimit);
+  int iculowlimit2=-1;
+  epregister(iculowlimit2);
+  double ficu=0.3;
+  epregister(ficu);
+  double ficu2=0.4;
+  epregister(ficu2);
 
+  int triggerdays=5;
+  epregister(triggerdays);
+  int triggercount=3;
+  epregister(triggercount);
+
+  double icuthres=0.0;
+  epregister(icuthres);
+
+  double fstep=0.1;
+  epregister(fstep);
+
+
+/*
   double ftrigger=1.0;
   epregister(ftrigger);
+*/
 
 //  daemonArgs(actionDaemon);
   epregister(sfile);
@@ -1971,6 +2009,15 @@ int emain()
   epregister(shpsel);
 
   eparseArgs();
+
+  if (rseed!=-1){
+    lwarn("setting seed. note: results are only reproducible when using the same number of threads");
+    rnd.setSeed(rseed);
+  }
+  cout << "# random seed: " << rnd.seed << endl;
+  cerr << "# random seed: " << rnd.seed << endl;
+
+
 
   st.rSA=st.rSA*cf; // correction for ratio of symptomatic/asymptomatic. Preliminary results from Hendrik Streeck show that this might be overestimated by 1.0/0.37 times
 
@@ -1993,7 +2040,6 @@ int emain()
     ldieif(tmparr.size()<2,"wrong format for event: <day>:<isolationfactor>,<day2>:<isolationfactor2>,...");
     oeventsArr.add(tmparr[0].i(),tmparr[1].f());
   }
-
 
   cerr << "# R0: " << st.R0 << endl;
 
@@ -2167,67 +2213,79 @@ int emain()
 
   int assigned=0;
   const int agegroupband=5; // years
-  eintarray tmpag(agegroups);
-  cerr << tmpag << endl;
+  int  tries=0;
+  bool incomplete;
 
-  // TODO: make gaussian distributed ages, this would take care of imperfect matches
-  // TODO: make this step a setup step requiring a different option to run that generates the household structure file.
-  for (int i=householdSizeDist.size()-1; i>=1; --i){
-    cerr << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
-    if (i==1)
-      cerr << tmpag << endl;
-    for (int j=0; j<hhlist[i].size(); ++j){
-      shousehold &sh(st.households[hhlist[i][j]]);
-      do {
-        ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
-        st.popindiv[sh.ageind].age=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
-        ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size());
-//        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
-      } while (tmpag[st.popindiv[sh.ageind].age]==0);
-      --tmpag[st.popindiv[sh.ageind].age];
-      ++assigned;
-
-//      // use single agegroup for hhLevels
-//      sh.hage=0; //st.pop_ages[sh.ageind];
-
-      // age group of "oldest" person in house
-      sh.hage=st.popindiv[sh.ageind].age;
-      sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
-
-      if (i>1){
+  do {
+    ++tries;
+    ldieif (tries>=4,"did not manage to seed households, try increasing number of larger households with -fflargehh 0.01");
+    incomplete=false;
+    eintarray tmpag(agegroups);
+    cerr << tmpag << endl;
+  
+    // TODO: make gaussian distributed ages, this would take care of imperfect matches
+    // TODO: make this step a setup step requiring a different option to run that generates the household structure file.
+    for (int i=householdSizeDist.size()-1; i>=1; --i){
+      cerr << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
+      if (i==1 && tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]>0){
+        incomplete=true;
+        break;
+      }
+      if (i==1)
+        cerr << tmpag << endl;
+      for (int j=0; j<hhlist[i].size(); ++j){
+        shousehold &sh(st.households[hhlist[i][j]]);
         do {
-          ldieif(sh.ageind+1<0 || sh.ageind+1>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.popindiv.size());
-          st.popindiv[sh.ageind+1].age=minint(st.popindiv[sh.ageind].age+int(rnd.uniformint(3))-2,tmpag.size()-1);
-          ldieif(st.popindiv[sh.ageind+1].age<0 || st.popindiv[sh.ageind+1].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind+1].age)+" "+tmpag.size());
-        } while (tmpag[st.popindiv[sh.ageind+1].age]==0);
-        --tmpag[st.popindiv[sh.ageind+1].age];
-//        if (avgage)
-//          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
+          ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
+          st.popindiv[sh.ageind].age=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
+          ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size());
+  //        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
+        } while (tmpag[st.popindiv[sh.ageind].age]==0 || i>=2 && tmpag[st.popindiv[sh.ageind].age]+tmpag[st.popindiv[sh.ageind].age-1]+tmpag[st.popindiv[sh.ageind].age-2]<=1); // if no individual of this age exists, or if the household is larger than 1 and only one individual exists that is younger or the same age (this will prevent the seeding from finishing in the next step)
+        --tmpag[st.popindiv[sh.ageind].age];
         ++assigned;
-      }   
-      // Children
-      for (int l=2; l<i; ++l){
-        do {
-          if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+3]==0)
-            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 4 + int(rnd.uniformint(3));
-          else if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]==0)
-            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 3;
-          else
-            st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + int(rnd.uniformint(3));
-/*
-          if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
-          else
-            st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
-*/
-        } while (tmpag[st.popindiv[sh.ageind+l].age]==0);
-        --tmpag[st.popindiv[sh.ageind+l].age];
-        ++assigned;
-//        if (avgage)
-//          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
+  
+  //      // use single agegroup for hhLevels
+  //      sh.hage=0; //st.pop_ages[sh.ageind];
+  
+        // age group of "oldest" person in house
+        sh.hage=st.popindiv[sh.ageind].age;
+        sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
+  
+        if (i>1){
+          do {
+            ldieif(sh.ageind+1<0 || sh.ageind+1>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.popindiv.size());
+            st.popindiv[sh.ageind+1].age=minint(st.popindiv[sh.ageind].age+int(rnd.uniformint(3))-2,tmpag.size()-1);
+            ldieif(st.popindiv[sh.ageind+1].age<0 || st.popindiv[sh.ageind+1].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind+1].age)+" "+tmpag.size());
+          } while (tmpag[st.popindiv[sh.ageind+1].age]==0);
+          --tmpag[st.popindiv[sh.ageind+1].age];
+  //        if (avgage)
+  //          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
+          ++assigned;
+        }   
+        // Children
+        for (int l=2; l<i; ++l){
+          do {
+            if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+3]==0)
+              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 4 + int(rnd.uniformint(3));
+            else if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]==0)
+              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 3;
+            else
+              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + int(rnd.uniformint(3));
+  /*
+            if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
+              st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
+            else
+              st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
+  */
+          } while (tmpag[st.popindiv[sh.ageind+l].age]==0);
+          --tmpag[st.popindiv[sh.ageind+l].age];
+          ++assigned;
+  //        if (avgage)
+  //          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
+        }
       }
     }
-  }
+  }while(incomplete);
   cerr << "# done populating households: " << assigned << endl;
 
 
@@ -2506,7 +2564,8 @@ int emain()
   double peakNonICU=0.0;
 
 //  ldieif(videoOpen(1024,768,5,1000)!=0,"error creating video file");
-  ldieif(videoOpen(1024,768,3,2000)!=0,"error creating video file");
+  if (ovideo.len())
+    ldieif(videoOpen(ovideo,1024,768,3,2000)!=0,"error creating video file");
 
 //  edoublearray localIprob;
 //  edoublearray localIprobGaussian;
@@ -2550,8 +2609,10 @@ int emain()
   st.localIprob.init(st.spGrid.size());
 
 
-  cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths" << endl;
-
+  cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths";
+  for (int i=1; i<printregions && st.shapes.size(); ++i)
+    cout << "\tallCases_" << i << "\tallICU_" << i << "\tallNonICU_" << i << "\tallD_" << i;
+  cout << endl;
 
 
 
@@ -2581,6 +2642,7 @@ int emain()
   st.threadDone=st.nthreads;
   for (int i=0; i<st.nthreads; ++i){
     st.threadStates.addref(new sthreadState);
+    st.threadStates[i].r.setSeed(rnd.uniformint(65565)); // initialize thread random seeds depending on main rng
     st.threadStates[i].evqueue.resize(st.dE.size()+1); // keep 1 extra for using as buffer for next step when adding new events
     st.threadStates[i].ageCounts.init(agegroups.size());
     st.threadStates[i].shapeCounts.init(st.shapeCounts.size());
@@ -2621,10 +2683,14 @@ int emain()
   int newICU=0,lastICU=0,lastICU2=0;
   char tmpsz[255];
   double Reff=1.0;
-  double ReffICU=1.0;
+  double avgDeltaICU=0.0;
   int triggerCount=0;
 
   double tmpicusmr=-1.0;
+
+  double lastTrigger=-10.0;
+
+  double isoStart=-1.0,isoEnd=-1.0;
 
   for (it=0; it*st.tstep<tmax; ++it){
     fE=double(st.allE)/popsize;
@@ -2655,10 +2721,12 @@ int emain()
       
 //      Reff=(lastCases==lastCases2?1.0:5.0*double((st.allCases-lastCases))/(lastCases-lastCases2)); 
       Reff=Reff*2.0/3.0+((lastCases==lastCases2?1.0:pow(double(st.allCases-lastCases)/(lastCases-lastCases2),5.0))/3.0); 
-      ReffICU=ReffICU*2.0/3.0+((lastICU==lastICU2?1.0:pow(double(st.allICU-lastICU)/(lastICU-lastICU2),5.0))/3.0); 
+//      ReffICU=ReffICU*2.0/3.0+((lastICU==lastICU2?1.0:pow(double(st.allICU-lastICU)/(lastICU-lastICU2),5.0))/3.0); 
+      avgDeltaICU=avgDeltaICU*2.0/3.0+(st.allICU-lastICU); 
 //      cout << "st.allCases: " << st.allCases << " lastCases: " << lastCases << " lastCases2: " << lastCases2 << endl;
 //      Reff=(st.allCases-lastCases)/(lastCases-lastCases2); 
-      renderFrame(tmpsz,st.smr,newCases,frameraw,st,vwidth,vheight);
+      if (ovideo.len())
+        renderFrame(tmpsz,st.smr,newCases,frameraw,st,vwidth,vheight);
       lastCases2=lastCases;
       lastCases=st.allCases;
       lastICU2=lastICU;
@@ -2668,22 +2736,54 @@ int emain()
       mktime(timeinfo);
 //      if (tmpicusmr<0.0 && st.allICU+18*newICU+18*(18+1)*newDeltaICU/2>iculimit){
 
-      if (iculimit>=0 && Reff<rthres2 && st.allICU<0.8*iculimit && tmpicusmr>=0.0){
+      if (oisotrigger>=0 && newCases>oisotrigger && isoStart<0.0){
+        st.soldr=foiso;
+        isoStart=floor(it*st.tstep);
+      }
+//      if (oisorelease>=0.0 && fE>=oisorelease && newCases<oisotrigger){
+      if (oisorelease>=0.0 && fE>=0.5 && newCases<oisorelease && isoEnd<0.0){
+        st.soldr=0.6;
+        isoEnd=floor(it*st.tstep);
+      }
+
+//      if (iculowlimit>=0 && Reff<rthres && st.allICU<iculowlimit && tmpicusmr>=0.0 && it*st.tstep-lastTrigger>=triggerdays && ReffICU<=0.9){
+      if (iculowlimit>=0 && Reff<rthres && st.allICU<iculowlimit && tmpicusmr>=0.0 && it*st.tstep-lastTrigger>=triggerdays && avgDeltaICU<icuthres){
+        --triggercount;
+        ficu=MIN(fstep+ficu,1.0);
+//        if (triggercount==0 || st.allCases>0.08*popsize) ficu=1.0;
+        if (triggercount==0) ficu=1.0;
+        st.smr=ficu; //0.40*ftrigger;
+        lastTrigger=it*st.tstep;
+        cerr << "# Reducing isolation: " << Reff << " " << st.smr << endl;
+        if (st.smr==1.0) tmpicusmr=-1.0;
+      } else if (icutrigger>=0.0 && newICU>icutrigger && triggerCount<1){
+        if (tmpicusmr<0.0){
+          lastTrigger=it*st.tstep;
+          tmpicusmr=st.smr;
+//          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
+          st.smr=ficu; //0.3*ftrigger;
+          cerr << "# ICU capacity triggered icu limit: " << newICU << " " << st.smr << endl;
+          ++triggerCount;
+        }
+      }
+/*
+      if (iculowlimit>=0 && Reff<rthres2 && st.allICU<iculowlimit2 && tmpicusmr>=0.0){
         st.smr=tmpicusmr;
         tmpicusmr=-1.0;
         cerr << "# low ICU remove icu limit: " << " " << st.smr << endl;
-      } else if (iculimit>=0 && Reff<rthres && st.allICU<0.9*iculimit && tmpicusmr>=0.0){
-        st.smr=0.40*ftrigger;
+      } else if (iculowlimit>=0 && Reff<rthres && st.allICU<iculowlimit && tmpicusmr>=0.0){
+        st.smr=ficu2; //0.40*ftrigger;
         cerr << "# Reducing isolation: " << " " << st.smr << endl;
       } else if (icutrigger>=0.0 && newICU>icutrigger && triggerCount<1){
         if (tmpicusmr<0.0){
           tmpicusmr=st.smr;
 //          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
-          st.smr=0.3*ftrigger;
+          st.smr=ficu; //0.3*ftrigger;
           cerr << "# ICU capacity triggered icu limit: " << st.allICU*exp(5*log(Reff)) << " " << st.smr << endl;
           ++triggerCount;
         }
       }
+*/
 /*
       if (iculimit>=0 && Reff<rthres2 && st.allICU<0.8*iculimit && tmpicusmr>=0.0){
         st.smr=tmpicusmr;
@@ -2821,13 +2921,19 @@ int emain()
     processEvents(st,nextEvents,rnd);
 */
 
-    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
+//    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
+    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD;
+    for (int i=1; i<printregions && st.shapes.size(); ++i)
+      cout << "\t" << st.shapeCounts[i].allCases << "\t" << st.shapeCounts[i].allICU << "\t" << st.shapeCounts[i].allNonICU << "\t" << st.shapeCounts[i].allD;
+    cout << endl;
 //    if (st.Ia[0]+st.Ia[1]+st.Is[0]+st.Is[1]+st.Ip[0]+st.Ip[1]==0) break;
   }
-  videoClose();
+
+  if (ovideo.len())
+    videoClose();
 //  cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 
-  cerr << "# fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << endl;
+  cerr << "# rseed: " << rnd.seed << " fglobal: " << st.fglobal << " ftravel: " << ftravel << " cf: " << cf << " R0: " << st.R0 << " fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << " isotime: " << (isoEnd-isoStart)/30.0 << endl;
 
   st.mutex.lock();
   st.threadI=st.nthreads;

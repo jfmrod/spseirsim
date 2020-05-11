@@ -9,4 +9,9 @@ write.table(popdem[popdem$name=="Sweden",],file="sweden.agegroups",sep="\t",col.
 write.table(popdem[popdem$name=="Spain",],file="spain.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
 write.table(popdem[popdem$name=="Germany",],file="germany.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
 write.table(popdem[popdem$name=="France",],file="france.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
+write.table(popdem[popdem$name=="Italy",],file="italy.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
+write.table(popdem[popdem$name=="Netherlands",],file="netherlands.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
+write.table(popdem[popdem$name=="Belgium",],file="belgium.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
+write.table(popdem[popdem$name=="Slovakia",],file="slovakia.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
+write.table(popdem[popdem$name=="Greece",],file="greece.agegroups",sep="\t",col.names=TRUE,row.names=FALSE)
 
