@@ -1963,6 +1963,9 @@ int emain()
   double oisorelease=-1;
   epregister(oisorelease);
 
+  double oisorelease2=-1;
+  epregister(oisorelease2);
+
   double foiso=0.05;
   epregister(foiso);
 
@@ -1975,12 +1978,12 @@ int emain()
 
   int iculowlimit=-1;
   epregister(iculowlimit);
-  int iculowlimit2=-1;
-  epregister(iculowlimit2);
+//  int iculowlimit2=-1;
+//  epregister(iculowlimit2);
   double ficu=0.3;
   epregister(ficu);
-  double ficu2=0.4;
-  epregister(ficu2);
+//  double ficu2=0.4;
+//  epregister(ficu2);
 
   int triggerdays=5;
   epregister(triggerdays);
@@ -2690,7 +2693,8 @@ int emain()
 
   double lastTrigger=-10.0;
 
-  double isoStart=-1.0,isoEnd=-1.0;
+  double isoStart=-1.0,isoEnd=-1.0,isoHighEnd=-1.0;
+  double oisoStart=-1.0,oisoEnd=-1.0,oisoHighEnd=-1.0;
 
   for (it=0; it*st.tstep<tmax; ++it){
     fE=double(st.allE)/popsize;
@@ -2736,14 +2740,18 @@ int emain()
       mktime(timeinfo);
 //      if (tmpicusmr<0.0 && st.allICU+18*newICU+18*(18+1)*newDeltaICU/2>iculimit){
 
-      if (oisotrigger>=0 && newCases>oisotrigger && isoStart<0.0){
+      if (oisotrigger>=0 && newCases>oisotrigger && oisoStart<0.0){
         st.soldr=foiso;
-        isoStart=floor(it*st.tstep);
+        oisoStart=floor(it*st.tstep);
       }
 //      if (oisorelease>=0.0 && fE>=oisorelease && newCases<oisotrigger){
-      if (oisorelease>=0.0 && fE>=0.5 && newCases<oisorelease && isoEnd<0.0){
+      if (oisorelease2>=0.0 && fE>=0.5 && newCases<oisorelease2 && oisoEnd<0.0){
+        st.soldr=1.0;
+        oisoEnd=floor(it*st.tstep);
+      }
+      if (oisorelease>=0.0 && fE>=0.5 && newCases<oisorelease && oisoHighEnd<0.0){
         st.soldr=0.6;
-        isoEnd=floor(it*st.tstep);
+        oisoHighEnd=floor(it*st.tstep);
       }
 
 //      if (iculowlimit>=0 && Reff<rthres && st.allICU<iculowlimit && tmpicusmr>=0.0 && it*st.tstep-lastTrigger>=triggerdays && ReffICU<=0.9){
@@ -2752,12 +2760,23 @@ int emain()
         ficu=MIN(fstep+ficu,1.0);
 //        if (triggercount==0 || st.allCases>0.08*popsize) ficu=1.0;
         if (triggercount==0) ficu=1.0;
+
+        if (ficu>0.35 && isoHighEnd<0.0){
+          if (st.smr>0.35) // not intensive initial isolation
+            isoHighEnd=isoStart;
+          else
+            isoHighEnd=floor(it*st.tstep);
+        }
+        isoEnd=floor(it*st.tstep);
+
+
         st.smr=ficu; //0.40*ftrigger;
         lastTrigger=it*st.tstep;
         cerr << "# Reducing isolation: " << Reff << " " << st.smr << endl;
         if (st.smr==1.0) tmpicusmr=-1.0;
       } else if (icutrigger>=0.0 && newICU>icutrigger && triggerCount<1){
         if (tmpicusmr<0.0){
+          isoStart=floor(it*st.tstep);
           lastTrigger=it*st.tstep;
           tmpicusmr=st.smr;
 //          st.smr=clamp(0.0,1.0,0.8*1.0/st.R0);
@@ -2933,7 +2952,7 @@ int emain()
     videoClose();
 //  cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 
-  cerr << "# rseed: " << rnd.seed << " fglobal: " << st.fglobal << " ftravel: " << ftravel << " cf: " << cf << " R0: " << st.R0 << " fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << " isotime: " << (isoEnd-isoStart)/30.0 << endl;
+  cerr << "# rseed: " << rnd.seed << " fglobal: " << st.fglobal << " ftravel: " << ftravel << " cf: " << cf << " R0: " << st.R0 << " fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << " highisotime: " << (isoHighEnd-isoStart)/30.0 << " lowisotime: " << (isoEnd-isoHighEnd)/30.0 << " oisohightime: " << (oisoHighEnd-oisoStart)/30.0 << " oisolowtime: " << (oisoEnd-oisoHighEnd)/30.0 << endl;
 
   st.mutex.lock();
   st.threadI=st.nthreads;
