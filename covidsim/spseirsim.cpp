@@ -45,6 +45,11 @@ struct scounts {
  int allD=0;
 };
 
+ostream& operator<<(ostream& os,const scounts& sc){
+  os << "allCases: " << sc.allCases << " allD: " << sc.allD << " allN: " << sc.allN;
+  return(os);
+}
+
 
 double xlonMin=180.0,xlonMax=-180.0;
 double ylatMin=90.0,ylatMax=-90.0;
@@ -235,7 +240,7 @@ struct sthreadState {
 };
 
 struct ssimstate {
-  double R0=2.7; // divided by number of days of infectiousness to obtain rate per day
+  double R0=2.7; // R0day is R0 divided by number of days of infectiousness to obtain rate per day
   double rSA=0.66; // ratio of Symptomatic/Asymptomatic
 //  const double iIa=0.5; // infectiosity of asymptomatic
 //  const double iIp=1.0; // infectiosity of presymptomatic
@@ -744,6 +749,7 @@ static int GTIFReportACorner( GTIF *gtif, GTIFDefn *defn, FILE * fp_out, const c
   return 0;
 }
 
+int validate=0;
 
 GTIF *gtif=0x00;
 float nodataval=0.0;
@@ -1752,9 +1758,27 @@ void threadUpdateEvents(ssimstate& st,sthreadState& ths,int i,int n,ernd& r)
 void threadSeedInfections(ssimstate& st,sthreadState& ths,int i,int n)
 {
 //  if (st.seedGrid < st.spGrid.size()*i/n || st.seedGrid >= st.spGrid.size()*(i+1)/n) return;
-  st.mutex.lock();
+//  st.mutex.lock();
 //  cerr << "i: " << i << " n: " << n << " " << st.spGrid.size()*i/n << " " << st.spGrid.size()*(i+1)/n << " " << st.spGrid.size() << endl;
-  st.mutex.unlock();
+//  st.mutex.unlock();
+
+  if (validate==1){ // infect all individuals
+    euintarray counts;
+    for (int ti=st.spGrid.size()*i/n; ti<st.spGrid.size()*(i+1)/n && ti<st.spGrid.size(); ++ti){
+      int gi=st.gridShuffle[ti];
+      for (int hs=0; hs<st.householdSize; ++hs){
+        int hl=hs*(hs+1)/2+hs; // top level: no infections in houses
+        for (int hg=0; hg<ngroups; ++hg){
+          if (st.hhLevelsBegin[gi*st.grow + hg*st.arow + hl+1]-st.hhLevelsBegin[gi*st.grow + hg*st.arow + hl]>0){
+            counts.init(hs+1,0);
+            counts[hs]=st.hhLevelsBegin[gi*st.grow + hg*st.arow + hl+1]-st.hhLevelsBegin[gi*st.grow + hg*st.arow + hl];
+            ths.evqueue.add(st,ths,gi,hg,hs,0,counts,st.dE,ths.r);
+          }
+        }
+      }
+    }
+    return;
+  }
 
 
   eintarray seedlist;
@@ -1771,10 +1795,18 @@ void threadSeedInfections(ssimstate& st,sthreadState& ths,int i,int n)
   edoublearray mp;
   euintarray counts;
 
-  for (int i=0; i<seedlist.size(); ++i){
-    counts.init(3,0);
-    counts[1]=st.iseedArr.values(seedlist[i]);
-    ths.evqueue.add(st,ths,st.iseedArr.keys(seedlist[i]),0,2,0,counts,st.dE,ths.r);
+  if (validate==3){ // single households only
+    for (int i=0; i<seedlist.size(); ++i){
+      counts.init(2,0);
+      counts[1]=st.iseedArr.values(seedlist[i]);
+      ths.evqueue.add(st,ths,st.iseedArr.keys(seedlist[i]),0,1,0,counts,st.dE,ths.r);
+    }
+  }else{
+    for (int i=0; i<seedlist.size(); ++i){
+      counts.init(3,0);
+      counts[1]=st.iseedArr.values(seedlist[i]);
+      ths.evqueue.add(st,ths,st.iseedArr.keys(seedlist[i]),0,2,0,counts,st.dE,ths.r);
+    }
   }
 }
 
@@ -1838,10 +1870,15 @@ void actionDaemon()
 }
 
 estr sfile;
+bool interactive=false;
 
 void bgThreadRun()
 {
-  startDaemon(sfile);
+  if (sfile.len())
+    startDaemon(sfile);
+  if (interactive)
+    setupInterpret();
+
   getSystem().run();
 }
 
@@ -1934,6 +1971,9 @@ int emain()
   double ftravel=0.2;
   epregister(ftravel);
 
+  estr evs;
+  epregister(evs);
+
   estrarray events;
   epregister(events);
 
@@ -1969,6 +2009,10 @@ int emain()
   double foiso=0.05;
   epregister(foiso);
 
+  double foiso2=0.5;
+  epregister(foiso2);
+
+
 
   double rthres=0.99;
   double rthres2=0.95;
@@ -1982,6 +2026,8 @@ int emain()
 //  epregister(iculowlimit2);
   double ficu=0.3;
   epregister(ficu);
+  double fisof=1.0;
+  epregister(fisof);
 //  double ficu2=0.4;
 //  epregister(ficu2);
 
@@ -2011,7 +2057,16 @@ int emain()
   shpsel.add("CNTR_CODE","CH");
   epregister(shpsel);
 
+  estr finfparams="data/agegroup.infparams.ferguson";
+  epregister(finfparams);
+
+  epregister(interactive);
+
+  epregister(validate);
+
   eparseArgs();
+
+  
 
   if (rseed!=-1){
     lwarn("setting seed. note: results are only reproducible when using the same number of threads");
@@ -2022,10 +2077,13 @@ int emain()
 
 
 
-  st.rSA=st.rSA*cf; // correction for ratio of symptomatic/asymptomatic. Preliminary results from Hendrik Streeck show that this might be overestimated by 1.0/0.37 times
+  st.rSA=st.rSA*cf; // correction for ratio of symptomatic/asymptomatic. Preliminary results from Hendrik Streeck show that this might be overestimated by 0.9/0.37 times relative to Ferguson's epidemiologic parameters
+
+
+
 
   ethreadFunc bgThread;
-  if (sfile.len())
+  if (sfile.len() || interactive)
     bgThread.run(bgThreadRun);
 
 
@@ -2044,25 +2102,64 @@ int emain()
     oeventsArr.add(tmparr[0].i(),tmparr[1].f());
   }
 
+  estrarray tmpevs(evs.explode(","));
+
+  cerr << "# tmpevs: " << tmpevs.size() << " " << evs << endl;
+
+  earrayof<estr,int> evsArr;
+  for (int i=0; i<tmpevs.size(); ++i){
+    int ti=tmpevs[i].find(":");
+    ldieif(ti<0,"wrong format for event: <day>:<cmds>,<day2>:<cmds2>,...");
+    int day=tmpevs[i].substr(0,ti).i();
+    estr cmd=tmpevs[i].substr(ti+1).replace(":",";")+";";
+    cerr << "# evs: " << day << " " << cmd <<  endl;
+    evsArr.add(day,cmd);
+  }
+
+
   cerr << "# R0: " << st.R0 << endl;
 
   eintarray agegroups;
 
-//  agegroups.init(16,500000);
-
-
+  // Maximum number of agegroups is defined by agegroup parameters file
   evarhash options;
   options.add("header",1);
   options.add("sep","\t");
+
+  etable agegroup_infparams(etableLoad(finfparams,options));
+  st.icu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],agegroup_infparams["Prop_hospitalised_critical"]);
+  st.nonicu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],sumarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0));
+  st.death_icu=edoublearray(agegroup_infparams["Prop_critical_fatal"]);
+  st.death_nonicu=edoublearray(agegroup_infparams["Prop_noncritical_fatal"]);
+
+  // need to add a separate death from covid outside of hospital care to account for underreporting of covid deaths (around 20%)
+
   etable agegroup_dem(etableLoad(fpop,options));
   agegroups=mularr(sumarr(agegroup_dem["\"f\""],agegroup_dem["\"m\""]),1000.0);
-  while (agegroups.size()>16){
-    agegroups[15]+=agegroups[agegroups.size()-1];
+
+  ldieif(agegroups.size()<agegroup_infparams.size(),"Not enough population age groups to match epidemiological parameters age groups");
+  while (agegroups.size()>agegroup_infparams.size()){ // aggregate all population counts for age groups above on last age group
+    agegroups[agegroup_infparams.size()-1]+=agegroups[agegroups.size()-1];
     agegroups.erase(agegroups.size()-1);
   }
-  // limit to 16 age groups
-//  cout << agegroups << endl;
-//  exit(0);
+
+  cerr << "# Limit case analysis: 100% exposure per age thresholds" << endl;
+  double totcritical=0.0,totdeaths=0.0,totpop=0.0;
+  for (int i=0; i<agegroups.size(); ++i){
+    totcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
+    totdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
+    totpop+=agegroups[i];
+  }
+  double tmpcritical=0.0,tmpdeaths=0.0,tmppop=0.0;
+  for (int i=0; i<agegroups.size(); ++i){
+    tmpcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
+    tmpdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
+    tmppop+=agegroups[i];
+    cerr << "# age: " << 5*i << " pop: " << tmppop << " (" << tmppop/totpop << ") critical: " << tmpcritical << " (" << tmpcritical/totcritical << ")" << " deaths: " << tmpdeaths << " (" << tmpdeaths/totdeaths << ")" <<endl;
+  }
+
+
+
 
   int popsize=0;
   for (int i=0; i<agegroups.size(); ++i)
@@ -2096,16 +2193,29 @@ int emain()
 
   // Ferguson et al 2006 has household distribution sizes in supplementary graphs which the values below approximate
   // UK statistics have updated information on households
-  st.householdSize=7;
+  
   eintarray householdSizeDist;
-  householdSizeDist.init(st.householdSize,0.0); // how many households with single individuals, two individuals, ... max 6
-  householdSizeDist[0]=0; // household with 0 susceptible
-  householdSizeDist[1]=(0.25+fsinglehh-flargehh*0.5)*popsize; 
-  householdSizeDist[2]=(0.28-fsinglehh*0.2-flargehh*0.5)*popsize/2.0;
-  householdSizeDist[3]=(0.20-fsinglehh*0.4+flargehh*0.2)*popsize/3.0; // 3 individual households, e.g.: two adults one child
-  householdSizeDist[4]=(0.17-fsinglehh*0.3+flargehh*0.4)*popsize/4.0;
-  householdSizeDist[5]=(0.08-fsinglehh*0.1+flargehh*0.2)*popsize/5.0;
-  householdSizeDist[6]=(0.02+flargehh*0.2)*popsize/6.0;
+  if (validate==3) { // no households (only single households)
+    st.householdSize=7;
+    householdSizeDist.init(st.householdSize,0.0); // how many households with single individuals, two individuals, ... max 6
+    householdSizeDist[0]=0; // household with 0 susceptible
+    householdSizeDist[1]=popsize; 
+    householdSizeDist[2]=0;
+    householdSizeDist[3]=0; // 3 individual households, e.g.: two adults one child
+    householdSizeDist[4]=0;
+    householdSizeDist[5]=0;
+    householdSizeDist[6]=0;
+  }else{
+    st.householdSize=7;
+    householdSizeDist.init(st.householdSize,0.0); // how many households with single individuals, two individuals, ... max 6
+    householdSizeDist[0]=0; // household with 0 susceptible
+    householdSizeDist[1]=(0.25+fsinglehh-flargehh*0.5)*popsize; 
+    householdSizeDist[2]=(0.28-fsinglehh*0.2-flargehh*0.5)*popsize/2.0;
+    householdSizeDist[3]=(0.20-fsinglehh*0.4+flargehh*0.2)*popsize/3.0; // 3 individual households, e.g.: two adults one child
+    householdSizeDist[4]=(0.17-fsinglehh*0.3+flargehh*0.4)*popsize/4.0;
+    householdSizeDist[5]=(0.08-fsinglehh*0.1+flargehh*0.2)*popsize/5.0;
+    householdSizeDist[6]=(0.02+flargehh*0.2)*popsize/6.0;
+  }
 
   int total_households=0,total_hh_individuals=0;
   for (int i=0; i<householdSizeDist.size(); ++i){
@@ -2117,27 +2227,6 @@ int emain()
 
   cerr << "# hh individuals: " << total_hh_individuals << "    " << popsize << endl;
   
-
-  etable agegroup_infparams(etableLoad("data/agegroup.infparams",options));
-
-  st.icu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],agegroup_infparams["Prop_hospitalised_critical"]);
-  st.nonicu_symp=mularr(agegroup_infparams["Prop_symp_hospitalised"],sumarr(mularr(agegroup_infparams["Prop_hospitalised_critical"],-1.0),1.0));
-  st.death_icu=edoublearray(agegroup_infparams["Prop_critical_fatal"]);
-  st.death_nonicu=edoublearray(agegroup_infparams["Prop_noncritical_fatal"]);
-  // need to add a separate death from covid outside of hospital care to account for underreporting of covid deaths (around 20%)
-
-  double totcritical=0.0,totdeaths=0.0;
-  for (int i=0; i<agegroups.size(); ++i){
-    totcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
-    totdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
-  }
-  double tmpcritical=0.0,tmpdeaths=0.0;
-  for (int i=0; i<agegroups.size(); ++i){
-    tmpcritical+=agegroups[i]*st.rSA*st.icu_symp[i];
-    tmpdeaths+=agegroups[i]*st.rSA*(st.icu_symp[i]*st.death_icu[i]+st.nonicu_symp[i]*st.death_nonicu[i])*df;
-    cerr << "# age: " << 5*i << " critical: " << tmpcritical << " (" << tmpcritical/totcritical << ")" << " deaths: " << tmpdeaths << " (" << tmpdeaths/totdeaths << ")" <<endl;
-  }
-
 
   
 //  cout << agegroup_infparams << endl;
@@ -2219,82 +2308,104 @@ int emain()
   int  tries=0;
   bool incomplete;
 
-  do {
-    ++tries;
-    ldieif (tries>=4,"did not manage to seed households, try increasing number of larger households with -fflargehh 0.01");
-    incomplete=false;
+
+  if (validate==3) { // only single households
     eintarray tmpag(agegroups);
-    cerr << tmpag << endl;
-  
-    // TODO: make gaussian distributed ages, this would take care of imperfect matches
-    // TODO: make this step a setup step requiring a different option to run that generates the household structure file.
-    for (int i=householdSizeDist.size()-1; i>=1; --i){
-      cerr << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
-      if (i==1 && tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]>0){
-        incomplete=true;
-        break;
-      }
-      if (i==1)
-        cerr << tmpag << endl;
-      for (int j=0; j<hhlist[i].size(); ++j){
-        shousehold &sh(st.households[hhlist[i][j]]);
-        do {
-          ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
-          st.popindiv[sh.ageind].age=int(5+(i-2)*0.5)+rnd.uniformint((tmpag.size()-int(5+(i-2)*0.5)-MAX(0,2*(i-2))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
-          ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size());
-  //        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
-        } while (tmpag[st.popindiv[sh.ageind].age]==0 || i>=2 && tmpag[st.popindiv[sh.ageind].age]+tmpag[st.popindiv[sh.ageind].age-1]+tmpag[st.popindiv[sh.ageind].age-2]<=1); // if no individual of this age exists, or if the household is larger than 1 and only one individual exists that is younger or the same age (this will prevent the seeding from finishing in the next step)
-        --tmpag[st.popindiv[sh.ageind].age];
-        ++assigned;
-  
-  //      // use single agegroup for hhLevels
-  //      sh.hage=0; //st.pop_ages[sh.ageind];
-  
-        // age group of "oldest" person in house
-        sh.hage=st.popindiv[sh.ageind].age;
-        sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
-  
-        if (i>1){
+    for (int j=0; j<hhlist[1].size(); ++j){
+      shousehold &sh(st.households[hhlist[1][j]]);
+      do {
+        ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
+        st.popindiv[sh.ageind].age=rnd.uniformint(tmpag.size());  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
+        ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size());
+//        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
+      } while (tmpag[st.popindiv[sh.ageind].age]==0); // if no individual of this age exists, or if the household is larger than 1 and only one individual exists that is younger or the same age (this will prevent the seeding from finishing in the next step)
+      --tmpag[st.popindiv[sh.ageind].age];
+    }
+  }else{
+    do {
+      ++tries;
+      ldieif (tries>=4,"did not manage to seed households, try increasing number of larger households with -fflargehh 0.01");
+      incomplete=false;
+      eintarray tmpag(agegroups);
+      cerr << "tmpag.size: " << tmpag.size() << endl;
+      cerr << tmpag << endl;
+    
+      // TODO: make gaussian distributed ages, this would take care of imperfect matches
+      // TODO: make this step a setup step requiring a different option to run that generates the household structure file.
+      for (int i=householdSizeDist.size()-1; i>=1; --i){
+        cerr << "# seeding individuals in households size: " << i << "   " << assigned << "   " << householdSizeDist[i] << "    " << (i==1?0:i-2)*householdSizeDist[i] << "    "  <<  tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3] << endl;
+        if (i==1 && tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]>0){
+          incomplete=true;
+          break;
+        }
+        if (i==1)
+          cerr << tmpag << endl;
+        for (int j=0; j<hhlist[i].size(); ++j){
+          shousehold &sh(st.households[hhlist[i][j]]);
           do {
-            ldieif(sh.ageind+1<0 || sh.ageind+1>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.popindiv.size());
-            st.popindiv[sh.ageind+1].age=minint(st.popindiv[sh.ageind].age+int(rnd.uniformint(3))-2,tmpag.size()-1);
-            ldieif(st.popindiv[sh.ageind+1].age<0 || st.popindiv[sh.ageind+1].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind+1].age)+" "+tmpag.size());
-          } while (tmpag[st.popindiv[sh.ageind+1].age]==0);
-          --tmpag[st.popindiv[sh.ageind+1].age];
-  //        if (avgage)
-  //          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
+            ldieif(sh.ageind<0 || sh.ageind>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind)+" "+st.popindiv.size());
+            st.popindiv[sh.ageind].age=int(5+(i-2)*0.5)+rnd.uniformint((int(tmpag.size())-int(5+(i-2)*0.5)-(MAX(0,2*(i-2)+int(tmpag.size())-16))));  // maxint is needed when the expression contains randomly generated numbers. Using the MAX macros causes the number to be generated twice!!
+            ldieif(st.popindiv[sh.ageind].age<0 || st.popindiv[sh.ageind].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind].age)+" "+tmpag.size()+" len: "+(tmpag.size()-int(5+(i-2)*0.5)-(MAX(0,2*(i-2)+int(tmpag.size())-16)))+" "+int(5+(i-2)*0.5));
+    //        st.pop_ages[sh.ageind]=5+(i-1)+rnd.uniform()*(tmpag.size()-5-(i-1)-MAX(0,2*(i-4)));
+          } while (tmpag[st.popindiv[sh.ageind].age]==0 || i>=2 && tmpag[st.popindiv[sh.ageind].age]+tmpag[st.popindiv[sh.ageind].age-1]+tmpag[st.popindiv[sh.ageind].age-2]<=1); // if no individual of this age exists, or if the household is larger than 1 and only one individual exists that is younger or the same age (this will prevent the seeding from finishing in the next step)
+          --tmpag[st.popindiv[sh.ageind].age];
           ++assigned;
-        }   
-        // Children
-        for (int l=2; l<i; ++l){
-          do {
-            if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+3]==0)
-              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 4 + int(rnd.uniformint(3));
-            else if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]==0)
-              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 3;
-            else
-              st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + int(rnd.uniformint(3));
-  /*
-            if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
-              st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
-            else
-              st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
-  */
-          } while (tmpag[st.popindiv[sh.ageind+l].age]==0);
-          --tmpag[st.popindiv[sh.ageind+l].age];
-          ++assigned;
-  //        if (avgage)
-  //          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
+    
+    //      // use single agegroup for hhLevels
+    //      sh.hage=0; //st.pop_ages[sh.ageind];
+    
+          // age group of "oldest" person in house
+          sh.hage=st.popindiv[sh.ageind].age;
+          sh.group=(sh.hage>=agethres/5?1:0); // set to 1 or 0 depending on age
+    
+          if (i>1){
+            do {
+              ldieif(sh.ageind+1<0 || sh.ageind+1>=st.popindiv.size(),"out of bounds: "+estr(sh.ageind+1)+" "+st.popindiv.size());
+              st.popindiv[sh.ageind+1].age=minint(st.popindiv[sh.ageind].age+int(rnd.uniformint(3))-2,tmpag.size()-1);
+              ldieif(st.popindiv[sh.ageind+1].age<0 || st.popindiv[sh.ageind+1].age>=tmpag.size(),"out of bounds: "+estr().sprintf("%hhi",st.popindiv[sh.ageind+1].age)+" "+tmpag.size());
+            } while (tmpag[st.popindiv[sh.ageind+1].age]==0);
+            --tmpag[st.popindiv[sh.ageind+1].age];
+    //        if (avgage)
+    //          sh.hage=(sh.hage+st.pop_ages[sh.ageind+1])/2;
+            ++assigned;
+          }   
+          // Children
+          for (int l=2; l<i; ++l){
+            do {
+              if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+3]==0)
+                st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 4 + int(rnd.uniformint(3));
+              else if (tmpag[MAX(0,st.popindiv[sh.ageind].age-9)]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+1]+tmpag[MAX(0,st.popindiv[sh.ageind].age-9)+2]==0)
+                st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + 3;
+              else
+                st.popindiv[sh.ageind+l].age=MAX(0,st.popindiv[sh.ageind].age-9) + int(rnd.uniformint(3));
+    /*
+              if (tmpag[0]+tmpag[1]+tmpag[2]+tmpag[3]+tmpag[4]==0)
+                st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)+1);
+              else
+                st.pop_ages[sh.ageind+l]=MAX(0,st.pop_ages[sh.ageind]-6+int(rnd.uniform()*3)-2);
+    */
+            } while (tmpag[st.popindiv[sh.ageind+l].age]==0);
+            --tmpag[st.popindiv[sh.ageind+l].age];
+            ++assigned;
+    //        if (avgage)
+    //          sh.hage=(sh.hage*l+st.pop_ages[sh.ageind+l])/(l+1);
+          }
         }
       }
-    }
-  }while(incomplete);
-  cerr << "# done populating households: " << assigned << endl;
+    }while(incomplete);
+    cerr << "# done populating households: " << assigned << endl;
+  }
 
 
   st.spGridW=rwidth;
   st.spGridH=rheight;
   st.spGridSize=st.spGridW*st.spGridH;
+  if (validate==2){ // no spatial
+    st.spGridW=1;
+    st.spGridH=1;
+    st.spGridSize=1;
+    imaxpop=0; // needed for seeding
+  }
   cerr << "# initializing spatial grid: " << st.spGridW << "x" << st.spGridH << endl;
   st.spGrid.init(st.spGridSize); // init 100 x 100 grid
   for (int i=0; i<st.spGrid.size(); ++i){
@@ -2322,98 +2433,39 @@ int emain()
   hhids.init(st.households.size());
   for (int i=0; i<hhids.size(); ++i)
     hhids[i]=i;
-//  permute(hhids,0,hhids.size(),rnd);
 
-
-  int gassign=0;
-  int gpopAll=0;
-  for (int i=0; i<st.spGrid.size(); ++i){
-    sgrid &g(st.spGrid[i]);
-    int gpop=popCounts[i];
-    if (gpop==0) continue;
-
-    if (popsize-gpopAll<10000) { cerr << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << "  gpop: " << gpop << endl; }
-    if (gpop > popsize-gpopAll) { cerr << "more individuals needed than available: " << gpop << " " << popsize-gpopAll << " gpos: " << i << " gsize: " << st.spGrid.size() << endl; /*exit(-1);*/ break; }
-    int hhcount=samplehh(hhids,st.households,gpop,rnd); // find a random set of hh that sum to popsize in the grid and put it at the end of hhids
-    for (int l=0; l<hhcount; ++l){
-      shousehold &hh(st.households[hhids[hhids.size()-1]]);
-      hh.gridpos=i;
+  if (validate==2){ // no spatial (single grid position)
+    st.nthreads=1; // cannot have more than one thread if doing a single grid position
+    sgrid &g(st.spGrid[0]);
+    for (int i=0; i<st.households.size(); ++i){
+      shousehold &hh(st.households[i]);
+      hh.gridpos=0;
       g.N[hh.group]+=hh.size;
-      gpopAll+=hh.size;
-      gpop-=hh.size;
-      ++gassign;
-      hhids.erase(hhids.size()-1);
     }
-    ldieif(popsize-gpopAll>2000 && gpop!=0,"gpop not zero? gpop: "+estr(gpop)+" i: "+estr(i));
-  }
-  ldieif(popsize-gpopAll!=0 || hhids.size()>0,"seeding households on grid failed, population size: " + estr(popsize) + " individuals in households on grid: " +estr(gpopAll)+" households left: "+hhids.size());
-
-/*
-//  gpopAllCounts
-  eintarray gposleft;
-
-  int gassign=0;
-  int gpopAll=0;
-  hi=0;
-  for (int i=0; i<rwidth*rheight; ++i){
-    int gpop=raster[i];
-    for (;hi<hhids.size() && st.households[hhids[hi]].size <= gpop; ++hi){
-      shousehold &hh(st.households[hhids[hi]]);
-      gpop-=hh.size;
-      hh.gridpos=i;
-      gpopAll+=hh.size;
-      ++gassign;
-      st.spGrid[hh.gridpos].N[hh.group]+=hh.size;
+  }else{
+    int gassign=0;
+    int gpopAll=0;
+    for (int i=0; i<st.spGrid.size(); ++i){
+      sgrid &g(st.spGrid[i]);
+      int gpop=popCounts[i];
+      if (gpop==0) continue;
+  
+      if (popsize-gpopAll<10000) { cerr << " pop left to assign: " << popsize-gpopAll << " households left: " << hhids.size() << " assigned households: " << gassign << " gridposition: " << i << "  gpop: " << gpop << endl; }
+      if (gpop > popsize-gpopAll) { cerr << "more individuals needed than available: " << gpop << " " << popsize-gpopAll << " gpos: " << i << " gsize: " << st.spGrid.size() << endl; /*exit(-1);*/ break; }
+      int hhcount=samplehh(hhids,st.households,gpop,rnd); // find a random set of hh that sum to popsize in the grid and put it at the end of hhids
+      for (int l=0; l<hhcount; ++l){
+        shousehold &hh(st.households[hhids[hhids.size()-1]]);
+        hh.gridpos=i;
+        g.N[hh.group]+=hh.size;
+        gpopAll+=hh.size;
+        gpop-=hh.size;
+        ++gassign;
+        hhids.erase(hhids.size()-1);
+      }
+      ldieif(popsize-gpopAll>2000 && gpop!=0,"gpop not zero? gpop: "+estr(gpop)+" i: "+estr(i));
     }
-    if (gpop>0)
-      gposleft.add(i);
+    ldieif(popsize-gpopAll!=0 || hhids.size()>0,"seeding households on grid failed, population size: " + estr(popsize) + " individuals in households on grid: " +estr(gpopAll)+" households left: "+hhids.size());
   }
-  for ( ;hi<hhids.size(); ++hi){
-    int ri;
-    shousehold &hh(st.households[hhids[hi]]);
-    cout << total_households-hi << " " << popsize-gpopAll << " " << hh.size << endl;
-    do{
-      ri=rnd.uniformint(gposleft.size());
-    }while (hh.size>raster[gposleft[ri]]-st.spGrid[gposleft[ri]].N[0]-st.spGrid[gposleft[ri]].N[1]);
-    sgrid &g(st.spGrid[gposleft[ri]]);
-    hh.gridpos=gposleft[ri];
-    gpopAll+=hh.size;
-    ++gassign;
-    g.N[hh.group]+=hh.size;
-    if (raster[gposleft[ri]]-g.N[0]-g.N[1]==0){
-      if (ri!=gposleft.size()-1)
-        swap(gposleft[ri],gposleft[gposleft.size()-1]);
-      gposleft.erase(gposleft.size()-1);
-    }
-  }
-  cout << "gassign: " << gassign << endl;
-  cout << "gridposleft: " << gposleft.size() << endl;
-  cout << "gpopleft: " << popsize-gpopAll << endl;
-*/
-
-/*
-  int gpopAllCounts=0;
-  eintarray gpopCounts;
-  gpopCounts.init(rwidth*rheight,0);
-  for (int i=0; i<gpopCounts.size(); ++i){
-    gpopCounts[i]=raster[i];
-    gpopAllCounts+=raster[i];
-  }
-
-  // randomly place households across grid
-  for (int i=0; i<st.households.size(); ++i){
-    shousehold &hh(st.households[hhids[i]]);
-
-    do{
-      hh.gridpos=rnd.uniformint(st.spGrid.size());
-    }while (gpopCounts[hh.gridpos]<hh.size);
-    gpopCounts[hh.gridpops]-=hh.size;
-    st.spGrid[hh.gridpos].N[hh.group]+=hh.size;
-    gpopAllCounts-=hh.size;
-    if (gpopAllCounts<100)
-      cout << gpopAllCounts << endl;
-  }
-*/
 
   cerr << "# initializing levels" << endl;
 
@@ -2570,29 +2622,9 @@ int emain()
   if (ovideo.len())
     ldieif(videoOpen(ovideo,1024,768,3,2000)!=0,"error creating video file");
 
-//  edoublearray localIprob;
-//  edoublearray localIprobGaussian;
-
-/*
-  edoublearray gaussianKernel;
-  gaussianKernel.init(11*11,0.0);
-  gaussianKernel[11*5+5]=0.6;
-  gaussianKernel[11*6+5]=0.1;
-  gaussianKernel[11*4+5]=0.1;
-  gaussianKernel[11*5+4]=0.1;
-  gaussianKernel[11*5+6]=0.1;
-*/
 
   st.travelKernel.init(11*11,0.0);
   st.travelKernelSize=11;
-
-/*
-  st.travelKernel[11*5+5]=0.6;
-  st.travelKernel[11*6+5]=0.1;
-  st.travelKernel[11*4+5]=0.1;
-  st.travelKernel[11*5+4]=0.1;
-  st.travelKernel[11*5+6]=0.1;
-*/
 
   double sump=0.0;
   for (int i=0; i<11; ++i){
@@ -2612,7 +2644,7 @@ int emain()
   st.localIprob.init(st.spGrid.size());
 
 
-  cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths";
+  cout << "Time" << "\t" << "Isolation" << "\t" << "OlderIsolation" << "\t" << "Reff" << "\t" << "fE" << "\t" << "allE" << "\t" << "allCases" << "\t" << "newCases" << "\t" << "newOCases" << "\t" << "allIa" << "\t" << "allIp" << "\t" << "allIs" << "\t" << "allICU" << "\t" << "allNonICU" << "\t" << "Deaths";
   for (int i=1; i<printregions && st.shapes.size(); ++i)
     cout << "\tallCases_" << i << "\tallICU_" << i << "\tallNonICU_" << i << "\tallD_" << i;
   cout << endl;
@@ -2681,8 +2713,9 @@ int emain()
   mktime(timeinfo);
   
 
-  int lastCases=0,lastCases2=0;
+  int lastCases=0,lastCases2=0,lastOCases=0;
   int newCases=0;
+  int newOCases=0;
   int newICU=0,lastICU=0,lastICU2=0;
   char tmpsz[255];
   double Reff=1.0;
@@ -2708,16 +2741,30 @@ int emain()
     if (peakNonICU < st.allNonICU)
       peakNonICU=st.allNonICU;
 
-    while (eventsArr.size()>0 && eventsArr.keys(0) <= it*st.tstep){
+    while (evsArr.size()>0 && (evsArr.keys(0)<0 && isoStart>=0 && -evsArr.keys(0)+isoStart <= it*st.tstep || evsArr.keys(0)>=0 && evsArr.keys(0)<=it*st.tstep)){
+      cerr << "# interpreting: " << evsArr.values(0) << endl;
+      epinterpret(evsArr.values(0));
+      evsArr.erase(0);
+    }
+    while (eventsArr.size()>0 && (eventsArr.keys(0)<0 && isoStart>=0 && -eventsArr.keys(0)+isoStart <= it*st.tstep || eventsArr.keys(0)>=0 && eventsArr.keys(0)<=it*st.tstep)){
       st.smr=eventsArr.values(0);
       eventsArr.erase(0);
     }
-    while (oeventsArr.size()>0 && oeventsArr.keys(0) <= it*st.tstep){
+    while (oeventsArr.size()>0 && (eventsArr.keys(0)<0 && isoStart>=0 && -oeventsArr.keys(0)+isoStart <= it*st.tstep || eventsArr.keys(0)>=0 && oeventsArr.keys(0)<=it*st.tstep)){
       st.soldr=oeventsArr.values(0);
       oeventsArr.erase(0);
     }
 
     if (it%4==0){
+
+      int tmpOCases=0;
+      for (int i=0; i<st.ageCounts.size(); ++i){
+        if (i>agethres/5)
+          tmpOCases+=st.ageCounts[i].allCases;
+      }
+      newOCases=tmpOCases-lastOCases;
+      lastOCases=tmpOCases;
+
       strftime(tmpsz,255,"%a %d %b",timeinfo);
       newCases=st.allCases-lastCases;
       newICU=st.allICU-lastICU;
@@ -2745,12 +2792,12 @@ int emain()
         oisoStart=floor(it*st.tstep);
       }
 //      if (oisorelease>=0.0 && fE>=oisorelease && newCases<oisotrigger){
-      if (oisorelease2>=0.0 && fE>=0.5 && newCases<oisorelease2 && oisoEnd<0.0){
+      if (oisorelease2>=0.0 && fE>=0.48 && newCases<oisorelease2 && oisoEnd<0.0){
         st.soldr=1.0;
         oisoEnd=floor(it*st.tstep);
       }
-      if (oisorelease>=0.0 && fE>=0.5 && newCases<oisorelease && oisoHighEnd<0.0){
-        st.soldr=0.6;
+      if (oisorelease>=0.0 && fE>=0.48 && newCases<oisorelease && oisoHighEnd<0.0){
+        st.soldr=foiso2;
         oisoHighEnd=floor(it*st.tstep);
       }
 
@@ -2768,13 +2815,14 @@ int emain()
             isoHighEnd=floor(it*st.tstep);
         }
         isoEnd=floor(it*st.tstep);
+        if (ficu>=fisof) ficu=fisof;
 
 
         st.smr=ficu; //0.40*ftrigger;
         lastTrigger=it*st.tstep;
         cerr << "# Reducing isolation: " << Reff << " " << st.smr << endl;
-        if (st.smr==1.0) tmpicusmr=-1.0;
-      } else if (icutrigger>=0.0 && newICU>icutrigger && triggerCount<1){
+        if (st.smr==fisof) tmpicusmr=-1.0;
+      } else if ((icutrigger>=0.0 && newICU>icutrigger || casestrigger>=0.0 && newCases>casestrigger) && triggerCount<1){
         if (tmpicusmr<0.0){
           isoStart=floor(it*st.tstep);
           lastTrigger=it*st.tstep;
@@ -2941,7 +2989,7 @@ int emain()
 */
 
 //    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
-    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD;
+    cout << it*st.tstep << "\t" << (1.0-st.smr) << "\t" << (1.0-st.soldr) << "\t" << Reff << "\t" << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << newOCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD;
     for (int i=1; i<printregions && st.shapes.size(); ++i)
       cout << "\t" << st.shapeCounts[i].allCases << "\t" << st.shapeCounts[i].allICU << "\t" << st.shapeCounts[i].allNonICU << "\t" << st.shapeCounts[i].allD;
     cout << endl;
@@ -2952,7 +3000,6 @@ int emain()
     videoClose();
 //  cout << double(st.allE)/popsize << "\t" << st.allE << "\t" << st.allCases << "\t" << newCases << "\t" << st.Ia[0]+st.Ia[1] << "\t" << st.Ip[0]+st.Ip[1] << "\t" << st.Is[0]+st.Is[1] << "\t" << st.allICU << "\t" << st.allNonICU << "\t" << st.allD << endl;
 
-  cerr << "# rseed: " << rnd.seed << " fglobal: " << st.fglobal << " ftravel: " << ftravel << " cf: " << cf << " R0: " << st.R0 << " fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << " highisotime: " << (isoHighEnd-isoStart)/30.0 << " lowisotime: " << (isoEnd-isoHighEnd)/30.0 << " oisohightime: " << (oisoHighEnd-oisoStart)/30.0 << " oisolowtime: " << (oisoEnd-oisoHighEnd)/30.0 << endl;
 
   st.mutex.lock();
   st.threadI=st.nthreads;
@@ -2961,6 +3008,16 @@ int emain()
   st.mutex.unlock();
 
   t.wait();
+
+  cerr << "# rseed: " << rnd.seed << " fglobal: " << st.fglobal << " ftravel: " << ftravel << " cf: " << cf << " R0: " << st.R0 << " fE: " << double(st.allE)/popsize << " tpeak: " << tpeak << " peakIs: " << peakIs << " peakICU: " << peakICU << " peakNonICU: " << peakNonICU << " deaths: " << st.allD << " highisotime: " << (isoHighEnd-isoStart)/30.0 << " lowisotime: " << (isoEnd-isoHighEnd)/30.0 << " oisohightime: " << (oisoHighEnd-oisoStart)/30.0 << " oisolowtime: " << (oisoEnd-oisoHighEnd)/30.0 << endl;
+
+  int youngAgeD=0,olderAgeD=0;
+  for (int i=0; i<st.ageCounts.size(); ++i){
+    if (i<=agethres/5) youngAgeD+=st.ageCounts[i].allD;
+    else olderAgeD+=st.ageCounts[i].allD;
+    cerr << i*5 << " " << st.ageCounts[i] << endl;
+  }
+  cerr << "youngerAgeD: " << youngAgeD << " olderAgeD: " << olderAgeD << endl;
 
   return(0);
 }

@@ -1,0 +1,38 @@
+# https://books.google.ch/books?id=1ccEAAAAQBAJ&pg=PA501&lpg=PA501&dq=number+and+size+distribution+of+nursing+homes&source=bl&ots=44Fgep-qe7&sig=ACfU3U1fEn9cooSzv-je_ybOOOu3E5oNPA&hl=en&sa=X&ved=2ahUKEwid9dyFobPpAhXBw8QBHXTVDloQ6AEwE3oECAYQAQ#v=onepage&q=number%20and%20size%20distribution%20of%20nursing%20homes&f=false
+
+Year: 2004
+Total nursing homes: 16100
+Roughly 1.7 million beds
+
+Beds	Percentage
+<50	13.9%
+50-99	37.3%
+100-199	42.5%
+>=200	6.2%
+
+Occupancy: 86.3%
+
+
+# https://www.cdc.gov/nchs/fastats/nursing-home-care.htm
+
+Year: 2016
+Total: 15600
+Residents: 1.3 million
+
+
+Total: 28900
+
+Beds	Counts	Percentage
+4-10	13200	45.6%
+11-25	4400	15.3%
+26-100	9100	31.5%
+>100	2200	7.7%
+
+Total: 996100
+Number of beds
+4-10	81800	8.2%
+11-25	76500	7.7%
+26-100	518300	52.0%
+>100	319500	32.1%
+
+
